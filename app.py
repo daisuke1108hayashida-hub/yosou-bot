@@ -1,10 +1,13 @@
 import os
-import re  # ←これを追加
-from datetime import datetime, timedelta, timezone
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, SourceGroup, SourceRoom
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from predictor import predict   # 予想関数がある前提
 
 app = Flask(__name__)
 
