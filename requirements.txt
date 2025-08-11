@@ -1,6 +1,5 @@
-Flask>=2.2,<3.0
-gunicorn>=21.2
-line-bot-sdk>=3.0,<4.0
-requests>=2.31
-beautifulsoup4>=4.12
-lxml>=5.0
+Flask==3.0.3
+gunicorn==21.2.0
+requests==2.32.3
+beautifulsoup4==4.12.3
+line-bot-sdk==2.4.1
