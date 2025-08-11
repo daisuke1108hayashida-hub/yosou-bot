@@ -1,6 +1,6 @@
 flask
 gunicorn
-line-bot-sdk>=2.4,<3.0
 requests
 beautifulsoup4
-lxml
+html5lib
+line-bot-sdk>=3.11.0,<4.0.0
