@@ -1,8 +1,7 @@
 import os
 import re
-import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
@@ -19,14 +18,19 @@ logger = logging.getLogger("yosou-bot")
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    raise RuntimeError("環境変数 LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN が未設定です。")
+    raise RuntimeError("LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN が未設定です。")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
 app = Flask(__name__)
 
-# ====== 場コード（日和の place_no） ======
+# ====== 出す点数上限 ======
+MAX_MAIN = 6
+MAX_COVER = 4
+MAX_ATTACK = 4
+
+# ====== 場コード（日和 place_no） ======
 PLACE_MAP = {
     "桐生": 1, "戸田": 2, "江戸川": 3, "平和島": 4, "多摩川": 5, "浜名湖": 6,
     "蒲郡": 7, "常滑": 8, "津": 9, "三国": 10, "びわこ": 11, "住之江": 12,
@@ -34,7 +38,7 @@ PLACE_MAP = {
     "下関": 19, "若松": 20, "芦屋": 21, "福岡": 22, "唐津": 23, "大村": 24,
 }
 
-# ====== ルーティング（ヘルスチェック） ======
+# ====== ルーティング ======
 @app.route("/")
 def root():
     return "ok", 200
@@ -63,14 +67,13 @@ def handle_text(event: MessageEvent):
     if text.lower() in ("help", "使い方", "？"):
         usage = (
             "使い方：\n"
-            "・『丸亀 8』のように「場名 レース番号」（日付省略可→今日）\n"
+            "・『丸亀 8』のように “場名 レース番号” （日付省略可→今日）\n"
             "・『丸亀 8 20250811』のように日付(YYYYMMDD)付きでもOK\n"
-            "※データは“ボートレース日和”を優先して取得します。"
+            "※データは“ボートレース日和”優先（直前→MyDataの順に取得）"
         )
         reply(event, usage)
         return
 
-    # 解析：『場名 レース番号 [日付8桁]』
     m = re.match(r"^\s*([^\s\d]+)\s+(\d{1,2})(?:\s+(\d{8}))?\s*$", text)
     if not m:
         reply(event, "入力例：『丸亀 8』 / 『丸亀 8 20250811』 / 『help』")
@@ -81,28 +84,40 @@ def handle_text(event: MessageEvent):
     date_yyyymmdd = m.group(3) or datetime.now().strftime("%Y%m%d")
 
     if place_name not in PLACE_MAP:
-        reply(event, f"場名が分かりません：{place_name}\n対応例：丸亀, 桐生, 唐津 など")
+        reply(event, f"場名が分かりません：{place_name}")
         return
 
     place_no = PLACE_MAP[place_name]
-
     header = f"📍 {place_name} {race_no}R ({format_date(date_yyyymmdd)})\n" + "─" * 22
+
+    url_jikzen = build_biyori_url(place_no, race_no, date_yyyymmdd, slider=4)   # 直前
+    url_mydata = build_biyori_url(place_no, race_no, date_yyyymmdd, slider=9)   # MyData
+
     try:
-        # 1) 日和（slider=4 直前情報）を優先
-        biyori_url = build_biyori_url(place_no, race_no, date_yyyymmdd, slider=4)
-        rows = fetch_biyori_table(biyori_url)
+        # 直前 → ダメなら MyData に即フォールバック
+        rows = None
+        tried = []
 
-        # 直前情報の時短：主要指標だけ抜粋
-        metrics = pick_metrics(rows)  # {'展示', '周回', '周り足', '直線', 'ST'} などが入れば使う
+        try:
+            rows = fetch_biyori_table(url_jikzen)
+            tried.append(url_jikzen)
+        except TableNotFound:
+            logger.warning("yosou-bot:[biyori] fetch failed (直前): %s", url_jikzen)
+            tried.append(url_jikzen)
 
-        # 2) 足りなければ MyData（slider=9）も併用して拡充
-        if len(metrics.keys()) < 2:
-            biyori_url2 = build_biyori_url(place_no, race_no, date_yyyymmdd, slider=9)
-            rows2 = fetch_biyori_table(biyori_url2)
-            metrics2 = pick_metrics(rows2)
-            metrics.update({k: v for k, v in metrics2.items() if k not in metrics})
+        if rows is None:
+            try:
+                rows = fetch_biyori_table(url_mydata)
+                tried.append(url_mydata)
+            except TableNotFound:
+                logger.warning("yosou-bot:[biyori] fetch failed (MyData): %s", url_mydata)
+                tried.append(url_mydata)
 
-        # 予想生成（超簡易ロジック）
+        if rows is None:
+            reply(event, f"{header}\n直前情報の取得に失敗しました。\n試行URL:\n- {url_jikzen}\n- {url_mydata}")
+            return
+
+        metrics = pick_metrics(rows)
         analysis = build_analysis(metrics)
         bets = build_bets(analysis)
 
@@ -114,28 +129,18 @@ def handle_text(event: MessageEvent):
             f"🎯 本線：{', '.join(bets['main'])}\n"
             f"🛡️ 抑え：{', '.join(bets['cover'])}\n"
             f"💥 狙い：{', '.join(bets['attack'])}\n"
-            f"\n(src: 日和 / {biyori_url})"
+            f"\n(src: 日和 / {tried[-1]})"
         )
         reply(event, msg)
 
-    except TableNotFound as e:
-        # 日和で取れなかった時は、理由とURLだけ返す
-        logger.warning("[biyori] fetch failed: %s", e.url)
-        fallback = (
-            f"{header}\n直前情報の取得に失敗しました。少し待ってから再度お試しください。\n"
-            f"(src: 日和 / {e.url})"
-        )
-        reply(event, fallback)
-
     except Exception as e:
         logger.exception("unhandled")
-        reply(event, f"{header}\nエラーが発生しました：{e}")
+        reply(event, f"{header}\nエラー：{e}")
 
-# ====== ここからロジック ======
+# ====== 共通関数 ======
 def format_date(yyyymmdd: str) -> str:
     try:
-        dt = datetime.strptime(yyyymmdd, "%Y%m%d")
-        return dt.strftime("%Y/%m/%d")
+        return datetime.strptime(yyyymmdd, "%Y%m%d").strftime("%Y/%m/%d")
     except Exception:
         return yyyymmdd
 
@@ -147,7 +152,7 @@ def build_biyori_url(place_no: int, race_no: int, yyyymmdd: str, slider: int = 4
 
 UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile Safari/604.1"
 )
 
 class TableNotFound(Exception):
@@ -156,40 +161,48 @@ class TableNotFound(Exception):
         self.url = url
 
 def fetch_biyori_table(url: str):
-    """日和のレース出走ページから、表データを二次元配列にして返す。
-       ヘッダ名や構造の揺れに耐えるよう、候補テーブルを総当たりで探索。"""
-    headers = {"User-Agent": UA, "Accept-Language": "ja,en;q=0.8"}
+    """日和のページから、直前/MyDataのどちらでも使える“表”を抽出して返す"""
+    headers = {
+        "User-Agent": UA,
+        "Accept-Language": "ja,en;q=0.8",
+        "Referer": "https://kyoteibiyori.com/",
+        "Cache-Control": "no-cache",
+    }
     r = requests.get(url, headers=headers, timeout=12)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
 
-    candidates = soup.find_all("table")
-    if not candidates:
+    # 候補テーブルを広めに取得
+    tables = soup.find_all("table")
+    if not tables:
         raise TableNotFound(url)
 
-    def looks_like_target(tbl):
-        # 直前情報 or MyData らしい行ラベルが含まれるかで判定
+    KEYWORDS = [
+        "選手情報", "直前情報", "MyData", "枠別情報",
+        "展示", "周回", "周り足", "直線", "ST", "平均ST"
+    ]
+
+    def looks_like(tbl):
         text = tbl.get_text(" ", strip=True)
-        keys = ["展示", "周回", "周り足", "直線", "ST", "平均ST", "枠別情報"]
-        return any(k in text for k in keys)
+        # キーワードのどれかを含む & 列が多い（6艇以上を期待）
+        has_key = any(k in text for k in KEYWORDS)
+        many_cols = max([len(tr.find_all(["th", "td"])) for tr in tbl.find_all("tr")] or [0]) >= 7
+        return has_key and many_cols
 
-    for tbl in candidates:
-        if not looks_like_target(tbl):
-            continue
-        rows = []
-        for tr in tbl.find_all("tr"):
-            cols = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
-            if cols and any(cols):
-                rows.append(cols)
-        # 6艇×複数指標が載ったテーブルが候補
-        if rows and any("1号" in " ".join(r) for r in rows) or len(rows) >= 6:
-            return rows
+    # もっとも“ありえそう”なテーブルを優先
+    candidates = [t for t in tables if looks_like(t)]
+    target = candidates[0] if candidates else None
+    if target is None:
+        raise TableNotFound(url)
 
-    raise TableNotFound(url)
+    rows = []
+    for tr in target.find_all("tr"):
+        cols = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
+        if cols:
+            rows.append(cols)
+    return rows
 
 def pick_metrics(rows):
-    """テーブル行から必要指標を拾って {label: [6艇分]} に整形。
-       取れた分だけ返す（無ければ空辞書）。"""
     metrics = {}
     labels = {
         "展示": ["展示", "展示タイム", "展示ﾀｲﾑ"],
@@ -198,39 +211,29 @@ def pick_metrics(rows):
         "直線": ["直線"],
         "ST": ["ST", "平均ST", "平均ＳＴ"],
     }
-
-    # 各行ラベルを見つけて6コース分を抽出
     for row in rows:
         label = row[0] if row else ""
         for key, alts in labels.items():
             if any(a in label for a in alts):
-                # 数値化（6艇分が並ぶことを想定。足りなければ埋める）
                 values = row[1:7]
                 values = [parse_float_safe(v) for v in values]
                 while len(values) < 6:
                     values.append(None)
                 metrics[key] = values[:6]
                 break
-
     return metrics
 
 def parse_float_safe(s):
     try:
-        s = s.replace("F", ".").replace("L", ".")  # まれに ST で F表記など混ざる対策
-    except Exception:
-        pass
-    try:
-        return float(re.findall(r"-?\d+(?:\.\d+)?", str(s))[0])
+        s = str(s).replace("F", ".").replace("L", ".")
+        m = re.findall(r"-?\d+(?:\.\d+)?", s)
+        return float(m[0]) if m else None
     except Exception:
         return None
 
 def build_analysis(metrics):
-    """超簡易：展示/周回/直線/ST をスコア化して上位を出す"""
-    # 小さいほど良い系：展示, 周回, ST / 大きいほど良い：直線
-    # それぞれ重み付け
     weights = {"展示": 0.35, "周回": 0.30, "直線": 0.25, "ST": 0.10}
 
-    # 正規化用に順位化する（Noneはビリ扱い）
     def rank_for(label, reverse=False):
         vals = metrics.get(label)
         if not vals:
@@ -241,68 +244,61 @@ def build_analysis(metrics):
                 pairs.append((9999 if not reverse else -9999, i))
             else:
                 pairs.append((v, i))
-        # reverse=False: 昇順（小さい方が良い） / reverse=True: 降順（大きい方が良い）
         pairs_sorted = sorted(pairs, key=lambda x: x[0], reverse=reverse)
         ranks = [0]*6
         for r, (_, idx) in enumerate(pairs_sorted, start=1):
             ranks[idx] = r
         return ranks
 
-    rank_ex = rank_for("展示", reverse=False)
-    rank_lap = rank_for("周回", reverse=False)
-    rank_lin = rank_for("直線", reverse=True)
-    rank_st = rank_for("ST", reverse=False)
+    rk_ex = rank_for("展示", False)
+    rk_lap = rank_for("周回", False)
+    rk_lin = rank_for("直線", True)
+    rk_st = rank_for("ST", False)
 
     score = [0]*6
     for i in range(6):
-        for label, rk in [("展示", rank_ex), ("周回", rank_lap), ("直線", rank_lin), ("ST", rank_st)]:
+        for label, rk in [("展示", rk_ex), ("周回", rk_lap), ("直線", rk_lin), ("ST", rk_st)]:
             if rk[i]:
-                score[i] += (7 - rk[i]) * weights[label]  # 1位=6点, 6位=1点 的なスコア
+                score[i] += (7 - rk[i]) * weights[label]
 
-    top = sorted(range(6), key=lambda i: score[i], reverse=True)
-    axis = top[0] + 1  # 軸（1〜6）
-
-    # ざっくりシナリオ文言
+    order = sorted(range(6), key=lambda i: score[i], reverse=True)
+    axis = order[0] + 1
     scenario = "①先制の逃げ本線" if axis == 1 else f"{axis}コース軸の攻め"
     reason = f"展示/周回/直線/ST の総合評価で {axis}号艇が最上位"
-
-    return {"axis": axis, "order": [i+1 for i in top], "scenario": scenario, "reason": reason}
+    return {"axis": axis, "order": [i+1 for i in order], "scenario": scenario, "reason": reason}
 
 def build_bets(analysis):
-    """軸＋相手上位から 3連単フォーマットの買い目を作る"""
     axis = analysis["axis"]
     order = [x for x in analysis["order"] if x != axis]
-    # 相手上位3艇
-    opp = order[:3] if len(order) >= 3 else order
+    top3 = order[:3]
+    top4 = order[:4]
 
-    def tri(a, b, c):
-        return f"{a}-{b}-{c}"
+    def tri(a, b, c): return f"{a}-{b}-{c}"
 
     main = []
+    if len(top3) >= 2:
+        for i, b in enumerate(top3):
+            for j, c in enumerate(top3):
+                if i == j: continue
+                main.append(tri(axis, b, c))
+    elif len(top3) == 1:
+        main.append(tri(axis, top3[0], order[1] if len(order) > 1 else (1 if axis != 1 else 2)))
+    main = dedup(main)[:MAX_MAIN]
+
     cover = []
+    if len(top3) >= 2:
+        for i, b in enumerate(top3):
+            for j, c in enumerate(top3):
+                if i == j: continue
+                cover.append(tri(b, axis, c))
+    cover = [x for x in dedup(cover) if x not in main][:MAX_COVER]
+
     attack = []
-
-    # 本線：軸-相手上位2-相手上位2（順序違い）
-    if len(opp) >= 2:
-        main.append(tri(axis, opp[0], opp[1]))
-        main.append(tri(axis, opp[1], opp[0]))
-    elif len(opp) == 1:
-        main.append(tri(axis, opp[0], order[2] if len(order) > 2 else 1 if axis != 1 else 2))
-
-    # 抑え：相手頭→軸→相手
-    if len(opp) >= 2:
-        cover.append(tri(opp[0], axis, opp[1]))
-        cover.append(tri(opp[1], axis, opp[0]))
-
-    # 狙い：3番手絡み or まくり差し想定
-    if len(opp) >= 3:
-        attack.append(tri(axis, opp[2], opp[0]))
-        attack.append(tri(opp[0], opp[1], axis))
-
-    # 重複除去
-    main = dedup(main)
-    cover = dedup([x for x in cover if x not in main])
-    attack = dedup([x for x in attack if x not in main + cover])
+    if len(top4) >= 4:
+        attack += [tri(axis, top4[3], top3[0]), tri(axis, top4[3], top3[1])]
+    if len(top3) >= 3:
+        attack += [tri(top3[0], top3[2], axis), tri(top3[1], top3[2], axis)]
+    attack = [x for x in dedup(attack) if x not in main + cover][:MAX_ATTACK]
 
     return {"main": main, "cover": cover, "attack": attack}
 
