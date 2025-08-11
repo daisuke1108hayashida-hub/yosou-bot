@@ -1,6 +1,6 @@
-flask
-gunicorn
-requests
-beautifulsoup4
-html5lib
-line-bot-sdk>=3.11.0,<4.0.0
+Flask>=2.2,<3.0
+gunicorn>=21.2
+line-bot-sdk>=3.0,<4.0
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
