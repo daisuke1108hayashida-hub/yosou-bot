@@ -1,47 +1,31 @@
+# -*- coding: utf-8 -*-
+import os
+import re
+import json
+import datetime as dt
+from itertools import product, permutations
+
 import requests
 from bs4 import BeautifulSoup
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+from flask import Flask, request, Response, jsonify
 
-def fetch_biyori(place_no: str, race_no: str, hiduke: str, slider: str = "4") -> dict | None:
-    """ボートレース日和（PC版優先）を取得→最も行数が多いテーブルを抽出。失敗時はNone。"""
-    bases = [
-        "https://kyoteibiyori.com/pc/race_shusso.php",   # ★PC版（表がサーバー描画）
-        "https://kyoteibiyori.com/race_shusso.php",      # フォールバック（通常版）
-    ]
-    params = f"place_no={place_no}&race_no={race_no}&hiduke={hiduke}&slider={slider}"
-    headers = {
-        "User-Agent": UA,
-        "Accept-Language": "ja,en;q=0.8",
-        "Referer": "https://kyoteibiyori.com/",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
+# ===== LINE Bot =====
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-    for base in bases:
-        url = f"{base}?{params}"
-        try:
-            r = requests.get(url, headers=headers, timeout=20)
-            r.raise_for_status()
-        except Exception:
-            continue
+app = Flask(__name__)
 
-        soup = BeautifulSoup(r.text, "lxml")
+# ----- 環境変数 -----
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 
-        # いろんな書き方に対応（table / .table / .table-responsive 内の table）
-        tables = soup.select("table") or soup.select(".table-responsive table") or []
-        if not tables:
-            continue
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
+handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
 
-        tb = max(tables, key=lambda t: len(t.find_all("tr")))
-        rows = []
-        for tr in tb.find_all("tr"):
-            cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
-            if cells:
-                rows.append(cells)
-
-        if rows:
-            return {"url": url, "rows": rows, "slider": slider}
-
-    return None
+# ===== 競艇場 -> place_no（ボートレース日和と同じ番号） =====
+PLACE_MAP = {
+    "桐生": 1, "戸田": 2, "江戸川": 3, "平和島": 4, "多摩川": 5,
+    "浜名湖": 6, "蒲郡": 7, "常滑": 8, "津": 9, "三国": 10,
+    "びわこ": 11, "住之江": 12, "尼崎": 13, "鳴門": 14, "丸亀":
