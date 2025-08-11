@@ -1,54 +1,120 @@
-# app.py
 import os
 import re
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, timedelta
 
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-# ====== Flask & LINE SDK 初期化 ======
+# -------------------------------
+# 基本セットアップ
+# -------------------------------
 app = Flask(__name__)
 
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    raise RuntimeError("環境変数 LINE_CHANNEL_SECRET と LINE_CHANNEL_ACCESS_TOKEN を設定してください。")
+    raise RuntimeError("環境変数 LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN が未設定です。")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# ====== 便利関数 ======
-def reply_text(token: str, text: str) -> None:
-    line_bot_api.reply_message(token, TextSendMessage(text=text))
+JST = timezone(timedelta(hours=9))
 
-JST = ZoneInfo("Asia/Tokyo")
-USAGE = (
+# -------------------------------
+# 場名 → 場コード
+# -------------------------------
+PLACE_CODE = {
+    "桐生": "01", "戸田": "02", "江戸川": "03", "平和島": "04", "多摩川": "05",
+    "浜名湖": "06", "蒲郡": "07", "常滑": "08", "津": "09", "三国": "10",
+    "びわこ": "11", "住之江": "12", "尼崎": "13", "鳴門": "14", "丸亀": "15",
+    "児島": "16", "宮島": "17", "徳山": "18", "下関": "19", "若松": "20",
+    "芦屋": "21", "福岡": "22", "唐津": "23", "大村": "24",
+}
+
+HELP_TEXT = (
     "使い方：\n"
-    "・『丸亀 8 20250808』のように送信（場名 レース番号 日付）\n"
-    "・日付は省略可（例：『丸亀 8』は今日の日付）\n"
-    "・ヘルプ：『help』または『使い方』"
+    "・『丸亀 8 20250808』のように送信（半角/全角スペースOK）\n"
+    "・日付省略可。例：『丸亀 8』→今日の日付で出走表URLと予想を返します\n"
+    "・対応競艇場："
+    + "、".join(PLACE_CODE.keys())
 )
 
-# ====== 予想ロジック（まずはダミー） ======
+# -------------------------------
+# ユーティリティ
+# -------------------------------
+def today_ymd() -> str:
+    return datetime.now(JST).strftime("%Y%m%d")
+
+def racelist_url(place: str, race_no: int, ymd: str) -> str:
+    """公式サイトの出走表URLを生成"""
+    jcd = PLACE_CODE.get(place)
+    if not jcd:
+        return ""
+    return f"https://www.boatrace.jp/owpc/pc/race/racelist?rno={race_no}&jcd={jcd}&hd={ymd}"
+
+def parse_input(text: str):
+    """
+    例:
+      丸亀 8 20250808
+      浜名湖12 20250811
+      住之江 9
+    を (place, race_no, ymd) にして返す。失敗時は None。
+    """
+    t = text.strip()
+
+    # help
+    if t.lower() in {"help", "ヘルプ", "使い方"}:
+        return ("__HELP__", None, None)
+
+    # 場名・R・日付(任意) を拾う
+    m = re.match(r"^\s*(\S+?)\s*([0-9１-９]{1,2})(?:\s*([0-9]{8}))?\s*$", t)
+    if not m:
+        return (None, None, None)
+
+    place = m.group(1)
+    # 全角数字→半角
+    race_no_str = m.group(2).translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    try:
+        race_no = int(race_no_str)
+    except ValueError:
+        return (None, None, None)
+
+    if not (1 <= race_no <= 12):
+        return (None, None, None)
+
+    ymd = m.group(3) if m.group(3) else today_ymd()
+
+    # 対応場のみ
+    if place not in PLACE_CODE:
+        return (None, None, None)
+
+    return (place, race_no, ymd)
+
 def predict(place: str, race_no: int, ymd: str) -> str:
     """
-    本線/抑え/狙い を返すダミー。
-    あとでここを実データ（成績/直前情報）で置き換える。
+    v0.1：まずは定型フォーマットで返す（のちほど実データで強化）
     """
-    # ここではサンプル固定返答
-    header = f"{place} {race_no}R（{ymd}）予想\n"
-    hon = "本線：1-2-全 / 1-全-2\n"
-    osa = "抑え：2-1-全\n"
-    ner = "狙い：4-1-2, 1-4-2\n"
-    tenkai = "展開：①スタート先手→2差し本線。4カド気配なら一撃注意。"
+    url = racelist_url(place, race_no, ymd)
+    header = f"\n"
+    if url:
+        header += f"出走表：{url}\n"
+    else:
+        header += "※場コード未対応\n"
 
-    return header + "\n".join([hon, osa, ner, tenkai])
+    # 超簡易テンプレ（後でロジックを入れ替える）
+    main =  "本線：1-2-3 / 1-3-2（イン想定）"
+    osa  =  "抑え：2-1-全（差し・差し返し）"
+    ner  =  "狙い：4-1-2, 1-4-2（カド一撃／まくり差し）"
+    tenkai = "展開：①先マイ本線。②の差し・④のカド気配に注意。"
 
-# ====== ルーティング ======
+    return "\n".join([header, main, osa, ner, tenkai])
+
+# -------------------------------
+# ルーティング
+# -------------------------------
 @app.route("/health")
 def health():
     return "ok", 200
@@ -59,7 +125,7 @@ def index():
 
 @app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get("X-Line-Signature", "")
+    signature = request.headers.get("X-Line-Signature")
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
@@ -67,35 +133,28 @@ def callback():
         abort(400)
     return "OK"
 
-# ====== メッセージ受信 ======
+# -------------------------------
+# イベントハンドラ
+# -------------------------------
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event: MessageEvent):
-    raw = (event.message.text or "").strip()
+    text = event.message.text or ""
+    place, race_no, ymd = parse_input(text)
 
-    # ヘルプ
-    if raw.lower() in ("help", "ヘルプ", "使い方"):
-        reply_text(event.reply_token, USAGE)
-        return
+    if place == "__HELP__":
+        reply = HELP_TEXT
+    elif place and race_no and ymd:
+        reply = predict(place, race_no, ymd)
+    else:
+        reply = "うまく読めませんでした。\n" + HELP_TEXT
 
-    # 形式: 「場名 レース番号 [YYYYMMDD]」
-    # 例: 「丸亀 8 20250808」/「丸亀 8」
-    m = re.match(r"^(\S+?)\s*(\d{1,2})(?:\s+(\d{8}))?$", raw)
-    if not m:
-        reply_text(event.reply_token, "入力形式が違います。\n" + USAGE)
-        return
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply)
+    )
 
-    place = m.group(1)
-    race_no = int(m.group(2))
-    ymd = m.group(3) or datetime.now(JST).strftime("%Y%m%d")
-
-    try:
-        result = predict(place, race_no, ymd)
-    except Exception as e:
-        result = f"予想中にエラーが発生しました：{e}"
-
-    reply_text(event.reply_token, result)
-
-# ====== ローカル実行用（Renderでは不要） ======
+# -------------------------------
+# ローカル実行用
+# -------------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
