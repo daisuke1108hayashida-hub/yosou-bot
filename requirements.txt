@@ -1,6 +1,6 @@
-Flask>=2.3
-gunicorn
-requests
-beautifulsoup4
-lxml
-line-bot-sdk==2.4.2
+Flask==3.0.2
+gunicorn==21.2.0
+line-bot-sdk==2.5.2
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.2.2
