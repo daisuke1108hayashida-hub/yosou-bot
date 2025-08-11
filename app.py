@@ -1,4 +1,5 @@
 import os
+import re  # ←これを追加
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
