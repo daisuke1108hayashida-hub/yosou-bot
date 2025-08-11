@@ -301,3 +301,62 @@ def on_message(event: MessageEvent):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+    
+# app.py（冒頭あたりの import に追記）
+from db import init_db, save_prediction, load_weights, settle_result
+
+# アプリ起動時にDB初期化
+init_db()
+
+# ===== 重みの読み込み例（会場別） =====
+# 予想ロジック内で venue を分かっているタイミングで:
+# weights = load_weights(venue)  # {"tenji":..,"syuukai":.., ...}
+
+# ===== 予想を作る関数の最後でログ保存 =====
+def build_and_reply_prediction(venue_name: str, date_str: str, race_no: int, features: dict) -> str:
+    """
+    features には直前情報やコース別成績など、今回の計算に使った素材を詰めてください
+    例: {
+      "直前": [{ "tenji":6.76,"syuukai":37.96,"mawari":5.41,"chokusen":7.88,"st":0.06 }, ... 6艇分 ],
+      "コース別": {...}
+    }
+    """
+    weights = load_weights(venue_name)
+
+    # ・・・ここであなたの現在の買い目ロジック・・・
+    # 例として
+    explain = "向かい風+直前タイム上位の1・4評価。外枠は展開待ち。"
+    main  = ["1-4-2","1-4-5"]     # ← 重複しないよう注意
+    osae  = ["1-2-4"]
+    narai = ["4-1-2"]
+
+    # レースキーを統一表記で
+    race_key = f"{venue_name}-{date_str}-{race_no:02d}"
+    save_prediction(race_key, venue_name, date_str, race_no, features, main, osae, narai, explain)
+
+    # LINE返信用テキストを返す（既存フォーマットでOK）
+    lines = []
+    lines.append("――――――――――――――")
+    lines.append("🧭 展開予想：" + explain)
+    lines.append("")
+    lines.append("🎯 本線：" + ", ".join(main))
+    lines.append("🛡 抑え：" + (", ".join(osae) if osae else "なし"))
+    lines.append("💥 狙い：" + (", ".join(narai) if narai else "なし"))
+    lines.append("")
+    lines.append("（このレースは保存されました）")
+    return "\n".join(lines)
+
+# ===== 管理用：結果反映エンドポイント =====
+# 例: https://<your>.onrender.com/admin/settle?venue=浜名湖&date=20250811&race=12&tri=1-4-2&payout=34560
+@app.route("/admin/settle", methods=["GET"])
+def admin_settle():
+    venue = request.args.get("venue")
+    date  = request.args.get("date")
+    race  = request.args.get("race", type=int)
+    tri   = request.args.get("tri")          # "1-2-3"
+    payout = request.args.get("payout", type=int)
+    if not (venue and date and race and tri):
+        return "missing params", 400
+    race_key = f"{venue}-{date}-{race:02d}"
+    ok = settle_result(race_key, tri, payout)
+    return ("ok", 200) if ok else ("not found or already settled", 404)
