@@ -1,46 +1,28 @@
 # app.py
-# LINE Bot / Flask / Render 用
-# 直前情報は「ボートレース日和」を最優先でスクレイピングします
-# 必要ENV: LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN
-# 任意ENV: BIYORI_URL_TEMPLATE (URLテンプレ差し替え用)
+import os, re, json, math, time, datetime as dt
+from datetime import timezone, timedelta
+from collections import defaultdict
 
-import os
-import re
-import time
-import json
-import traceback
 import requests
-from datetime import datetime, timedelta, timezone
-
-from flask import Flask, request, abort
 from bs4 import BeautifulSoup
+from flask import Flask, request, abort
 
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-# ========= 基本セットアップ =========
-app = Flask(__name__)
-
-CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+# ====== 環境変数 ======
+CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    raise RuntimeError("環境変数 LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN を設定してください")
+    raise RuntimeError("環境変数が未設定: LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-JST = timezone(timedelta(hours=9))
+# ====== Flask ======
+app = Flask(__name__)
 
-# 競艇場名 → jcd
-JCD = {
-    "桐生": 1, "戸田": 2, "江戸川": 3, "平和島": 4, "多摩川": 5, "浜名湖": 6, "蒲郡": 7, "常滑": 8,
-    "津": 9, "三国": 10, "びわこ": 11, "住之江": 12, "尼崎": 13, "鳴門": 14, "丸亀": 15,
-    "児島": 16, "宮島": 17, "徳山": 18, "下関": 19, "若松": 20, "芦屋": 21, "福岡": 22,
-    "唐津": 23, "大村": 24,
-}
-
-# ========= ヘルスチェック =========
 @app.route("/health")
 def health():
     return "ok", 200
@@ -49,167 +31,6 @@ def health():
 def index():
     return "ok", 200
 
-# ========= 直前情報（ボートレース日和優先） =========
-def get_biyori_preinfo(venue: str, rno: int, yyyymmdd: str):
-    """
-    ボートレース日和の「直前情報」テーブルを取得して整形
-    戻り値:
-      {
-        "per_lane": {1:{指標:値,...},...,6:{...}},
-        "url": "<参照URL>",
-        "src": "biyori"
-      }
-    失敗時は None
-    """
-    try:
-        jcd = JCD.get(venue)
-        if not jcd:
-            return None
-
-        # URL テンプレ（変わる可能性に備え ENV で上書き可）
-        tmpl = os.getenv(
-            "BIYORI_URL_TEMPLATE",
-            "https://kyoteibiyori.com/race?jcd={jcd}&hd={date}&rno={rno}"
-        )
-        url = tmpl.format(jcd=jcd, date=yyyymmdd, rno=rno)
-
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=15)
-        res.raise_for_status()
-        soup = BeautifulSoup(res.text, "lxml")
-
-        # 「直前情報」タブのテーブルを推定（展示/周回/周り足/直線/ST が含まれている）
-        target_table = None
-        for table in soup.find_all("table"):
-            txt = table.get_text(" ", strip=True)
-            hits = sum(k in txt for k in ["展示", "周回", "周り足", "直線", "ST"])
-            if hits >= 4:
-                target_table = table
-                break
-        if not target_table:
-            return None
-
-        rows = [
-            [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
-            for tr in target_table.find_all("tr")
-        ]
-        if not rows or len(rows) < 2:
-            return None
-
-        # 1行目: 1号艇〜6号艇（想定）
-        metrics = [r[0] for r in rows[1:]]             # 指標名（展示/周回/…）
-        values_matrix = [r[1:] for r in rows[1:]]       # 各号艇の値
-
-        per_lane = {}
-        num_lanes = min(6, max(len(v) for v in values_matrix))
-        for lane in range(num_lanes):
-            per_lane[lane + 1] = {}
-            for midx, m in enumerate(metrics):
-                val = values_matrix[midx][lane] if lane < len(values_matrix[midx]) else ""
-                per_lane[lane + 1][m] = val
-
-        return {"per_lane": per_lane, "url": url, "src": "biyori"}
-    except Exception:
-        return None
-
-def get_official_preinfo(venue: str, rno: int, yyyymmdd: str):
-    """
-    公式はフォールバック用途。必要なら後で実装を厚くする。
-    ここでは None を返す（＝利用しない）。
-    """
-    return None
-
-def get_pre_race_info(venue: str, rno: int, yyyymmdd: str):
-    """
-    呼び出し用：①日和 → ②公式 の順で試す
-    """
-    data = get_biyori_preinfo(venue, rno, yyyymmdd)
-    if data:
-        return data
-    return get_official_preinfo(venue, rno, yyyymmdd)
-
-# ========= 予想ロジック（軽量版） =========
-def _to_float(s):
-    try:
-        return float(re.findall(r"[0-9.]+", s)[0])
-    except Exception:
-        return None
-
-def build_prediction_from_preinfo(preinfo: dict):
-    """
-    per_lane から簡易スコアを作成して展開文&買い目を生成
-    - 展示（小さいほど良い）
-    - 直線（大きいほど良い）
-    の2軸を0〜1で正規化して合算。
-    """
-    per = preinfo.get("per_lane", {})
-    # 値の取得
-    demo = {i: _to_float(per[i].get("展示", "")) for i in per}
-    straight = {i: _to_float(per[i].get("直線", "")) for i in per}
-
-    # 正規化
-    score = {}
-    d_vals = [v for v in demo.values() if v is not None]
-    s_vals = [v for v in straight.values() if v is not None]
-    d_min, d_max = (min(d_vals), max(d_vals)) if d_vals else (None, None)
-    s_min, s_max = (min(s_vals), max(s_vals)) if s_vals else (None, None)
-
-    for i in per:
-        sc = 0.0
-        d = demo[i]; s = straight[i]
-        if d is not None and d_min is not None and d_max is not None and d_max != d_min:
-            sc += (d_max - d) / (d_max - d_min)  # 展示は小さいほど加点
-        if s is not None and s_min is not None and s_max is not None and s_max != s_min:
-            sc += (s - s_min) / (s_max - s_min)  # 直線は大きいほど加点
-        score[i] = sc
-
-    # スコア順
-    order = sorted(score.keys(), key=lambda k: score[k], reverse=True)
-    if len(order) < 3:
-        # データ不足なら適当に並び替え
-        order = list(range(1, 7))[:max(3, len(order))]
-
-    # 展開コメント
-    lead = order[0]; chase = order[1]
-    scenario = f"直前指標は{lead}号艇が軸、続く{chase}号艇。内先行から差し・まくり差し警戒。"
-
-    # 買い目
-    # 本線：軸-相手-三番手
-    hon = [f"{lead}-{chase}-{order[2]}", f"{lead}-{order[2]}-{chase}"]
-    # 抑え：相手-軸-三番手
-    osa = [f"{chase}-{lead}-{order[2]}", f"{chase}-{lead}-{order[3] if len(order)>3 else order[2]}"]
-    # 狙い：三番手絡みのひねり
-    ner = [f"{order[2]}-{lead}-{chase}", f"{order[2]}-{chase}-{lead}"]
-
-    return scenario, hon, osa, ner
-
-# ========= 入力パース =========
-HELP_TEXT = (
-    "使い方：\n"
-    "・『丸亀 8 20250811』のように送信（日時省略可。例：『丸亀 8』は今日の8R）\n"
-    "・『help』でこの説明を表示\n"
-)
-
-def parse_user_text(text: str):
-    """
-    返り値: (venue, rno, yyyymmdd) or (None,None,None)  ※helpは別扱い
-    例: '丸亀 8 20250811' / '丸亀 8'
-    """
-    t = text.strip().replace("　", " ")
-    if re.fullmatch(r"(?i)help|ヘルプ", t):
-        return "HELP", None, None
-
-    m = re.match(r"^(\S+)\s+(\d{1,2})(?:\s+(\d{8}))?$", t)
-    if not m:
-        return None, None, None
-    venue = m.group(1)
-    rno = int(m.group(2))
-    date = m.group(3)
-    if date is None:
-        date = datetime.now(JST).strftime("%Y%m%d")
-    return venue, rno, date
-
-# ========= LINE Webhook =========
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
@@ -218,57 +39,343 @@ def callback():
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
-    return "ok"
+    return "OK"
+
+# ====== 共通 ======
+JST = timezone(timedelta(hours=9))
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (YosouBot/1.0; +https://example.com)",
+    "Accept-Language": "ja,en;q=0.9",
+    "Referer": "https://kyoteibiyori.com/",
+}
+BIYORI_URL_TEMPLATE = os.getenv(
+    "BIYORI_URL_TEMPLATE",
+    "https://kyoteibiyori.com/race?jcd={jcd}&hd={date}&rno={rno}#preinfo"
+)
+
+# 競艇場 → JCD
+JCD = {
+    "桐生":"01","戸田":"02","江戸川":"03","平和島":"04","多摩川":"05",
+    "浜名湖":"06","蒲郡":"07","常滑":"08","津":"09","三国":"10",
+    "びわこ":"11","住之江":"12","尼崎":"13","鳴門":"14","丸亀":"15",
+    "児島":"16","宮島":"17","徳山":"18","下関":"19","若松":"20",
+    "芦屋":"21","福岡":"22","唐津":"23","大村":"24"
+}
+PLACE_ALIAS = {
+    "はまなこ":"浜名湖","はまな湖":"浜名湖","常滑":"常滑","とこなめ":"常滑",
+    "からつ":"唐津","まるがめ":"丸亀","からつ競艇":"唐津","丸亀競艇":"丸亀",
+    "住之江競艇":"住之江","鳴門競艇":"鳴門","児島競艇":"児島"
+}
+
+def norm_place(s: str) -> str:
+    s = s.strip()
+    s = s.replace("競艇","").replace("ボートレース","").replace("場","")
+    if s in PLACE_ALIAS: s = PLACE_ALIAS[s]
+    return s
+
+DATE_RE = re.compile(r"\b(20\d{6})\b")
+INPUT_RE = re.compile(r"^\s*(\S+)\s+(\d{1,2})(?:\s+(20\d{6}))?\s*$")
+
+def parse_input(text: str):
+    """『丸亀 8 20250811』/『丸亀 8』 を解析。返り値: (place, rno:int, yyyymmdd:str)"""
+    m = INPUT_RE.match(text)
+    if not m: return None, None, None
+    place = norm_place(m.group(1))
+    try:
+        rno = int(m.group(2))
+    except:
+        rno = None
+    ymd = m.group(3)
+    if not ymd:
+        today = dt.datetime.now(JST).strftime("%Y%m%d")
+        ymd = today
+    return place, rno, ymd
+
+def build_biyori_url(place: str, rno: int, ymd: str) -> str:
+    jcd = JCD.get(place)
+    if not jcd: return ""
+    return BIYORI_URL_TEMPLATE.format(jcd=jcd, rno=rno, date=ymd)
+
+def cache_get(key): return None
+def cache_set(key, val, ttl=180): return
+
+# ====== kyoteibiyori 直前情報 ======
+def fetch_biyori_preinfo(url: str) -> str:
+    sess = requests.Session()
+    sess.headers.update(UA_HEADERS)
+
+    try_urls = [url, url.split("#")[0]]
+    for u in try_urls:
+        r = sess.get(u, timeout=20, allow_redirects=True)
+        if r.status_code == 200 and ("直前" in r.text or "展示" in r.text or "周回" in r.text):
+            return r.text
+    raise RuntimeError("直前ページの取得に失敗")
+
+NUM = re.compile(r"[0-9]+\.[0-9]+|[0-9]+")
+
+def _num(x):
+    if x is None: return None
+    x = str(x).strip()
+    if not x: return None
+    # ST 例: F.05, .05, 0.05
+    x = x.replace("F.","").replace("F", "")
+    m = NUM.search(x)
+    return float(m.group()) if m else None
+
+def parse_biyori_table(html: str):
+    """
+    直前タブの表をざっくり抽出。
+    返り: [{lane, name, show, lap, mawari, straight, st}, ...]
+    値が無い時は None
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    # 「直前情報」タブ配下の最初の table を狙う
+    tables = soup.find_all("table")
+    if not tables: return []
+    cand = None
+    for t in tables:
+        txt = t.get_text(" ", strip=True)
+        if ("直前" in txt or "展示" in txt) and any(col in txt for col in ["展示","周回","直線","ST"]):
+            cand = t; break
+    if cand is None:
+        # それでも見つからない時は最初の大きめテーブル
+        cand = tables[0]
+
+    # ヘッダ列のインデックス推定
+    headers = [th.get_text(strip=True) for th in cand.find_all("th")]
+    head_row = None
+    for tr in cand.find_all("tr"):
+        ths = [th.get_text(strip=True) for th in tr.find_all("th")]
+        if ths: head_row = ths; break
+    cols = {"展示":-1,"周回":-1,"周り足":-1,"直線":-1,"ST":-1,"選手":-1,"進入":-1}
+    if head_row:
+        for i,h in enumerate(head_row):
+            for k in list(cols.keys()):
+                if k in h and cols[k] == -1:
+                    cols[k] = i
+
+    rows = []
+    for tr in cand.find_all("tr"):
+        tds = [td.get_text(strip=True) for td in tr.find_all(["td"])]
+        if not tds: continue
+        # レーン判定（1〜6がどこかに含まれている/進入列）
+        lane = None
+        if cols["進入"] >=0 and cols["進入"] < len(tds):
+            lane = _num(tds[cols["進入"]])
+        if lane is None:
+            # 左端に 1〜6 らしき表示が来るケース
+            lane = _num(tds[0])
+        if lane is None or not (1 <= int(lane) <= 6):
+            continue
+
+        name = None
+        if cols["選手"] >=0 and cols["選手"]<len(tds):
+            name = tds[cols["選手"]]
+
+        show = _num(tds[cols["展示"]]) if cols["展示"]>=0 and cols["展示"]<len(tds) else None
+        lap  = _num(tds[cols["周回"]]) if cols["周回"] >=0 and cols["周回"] <len(tds) else None
+        mawa = _num(tds[cols["周り足"]]) if cols["周り足"]>=0 and cols["周り足"]<len(tds) else None
+        stra = _num(tds[cols["直線"]]) if cols["直線"] >=0 and cols["直線"] <len(tds) else None
+        st   = _num(tds[cols["ST"]]) if cols["ST"]    >=0 and cols["ST"]    <len(tds) else None
+
+        rows.append({
+            "lane": int(lane), "name": name or "",
+            "show": show, "lap": lap, "mawari": mawa, "straight": stra, "st": st
+        })
+    rows.sort(key=lambda x:x["lane"])
+    return rows
+
+def _scale_desc(arr):  # 小さいほど良い → 点数大
+    xs = [a for a in arr if a is not None]
+    if not xs: return {i:0 for i in range(1,7)}
+    mn, mx = min(xs), max(xs)
+    res = {}
+    for lane,val in enumerate(arr, start=1):
+        if val is None: res[lane]=0
+        else:
+            res[lane] = 1.0 if mx==mn else (mx-val)/(mx-mn)
+    return res
+
+def _scale_asc(arr):   # 大きいほど良い → 点数大
+    xs = [a for a in arr if a is not None]
+    if not xs: return {i:0 for i in range(1,7)}
+    mn, mx = min(xs), max(xs)
+    res = {}
+    for lane,val in enumerate(arr, start=1):
+        if val is None: res[lane]=0
+        else:
+            res[lane] = 1.0 if mx==mn else (val-mn)/(mx-mn)
+    return res
+
+def build_scores(rows):
+    show    = [None]*6
+    lap     = [None]*6
+    mawari  = [None]*6
+    straight= [None]*6
+    st      = [None]*6
+    for r in rows:
+        i = r["lane"]-1
+        show[i]=r["show"]; lap[i]=r["lap"]; mawari[i]=r["mawari"]
+        straight[i]=r["straight"]; st[i]=r["st"]
+
+    s_show  = _scale_desc(show)     # 展示タイムは低いほど◎
+    s_lap   = _scale_desc(lap)      # 周回は低いほど◎
+    s_mawa  = _scale_asc(mawari)    # 周り足は高いほど◎（サイトの数値に依存）
+    s_stra  = _scale_asc(straight)  # 直線は高いほど◎
+    s_st    = _scale_desc(st)       # STは低いほど◎
+
+    # 重み（好みで調整可）
+    w = {"show":0.35,"lap":0.25,"mawari":0.15,"straight":0.15,"st":0.10}
+
+    scores = {}
+    for lane in range(1,7):
+        scores[lane] = (
+            s_show[lane]*w["show"] + s_lap[lane]*w["lap"] +
+            s_mawa[lane]*w["mawari"] + s_stra[lane]*w["straight"] +
+            s_st[lane]*w["st"]
+        )
+    return scores
+
+def make_narrative(rows, scores):
+    # 上位を説明（簡易）
+    order = sorted(scores.items(), key=lambda x:x[1], reverse=True)
+    top = [o[0] for o in order[:3]]
+    basis = []
+    for lane in top:
+        r = rows[lane-1]
+        tips = []
+        if r["show"] is not None: tips.append(f"展示{r['show']:.2f}")
+        if r["straight"] is not None: tips.append(f"直線{r['straight']:.2f}")
+        if r["st"] is not None: tips.append(f"ST{r['st']:.2f}")
+        basis.append(f"{lane}号艇（{'・'.join(tips)}）")
+    txt = f"展開予想：内寄り優勢。直前指標は上位{', '.join(map(str, top))}が良好。\n根拠："
+    txt += " / ".join(basis[:3])
+    return txt
+
+def make_picks(scores):
+    order = [lane for lane,_ in sorted(scores.items(), key=lambda x:x[1], reverse=True)]
+    # 本線：1着=上位2、2着=上位3、3着=上位4の組み合わせから重複なしで数点
+    a = order[:2]; b = order[:3]; c = order[:4]
+    hon = []
+    for x in a:
+        for y in b:
+            if y==x: continue
+            for z in c:
+                if z==x or z==y: continue
+                hon.append(f"{x}-{y}-{z}")
+                if len(hon)>=4: break
+            if len(hon)>=4: break
+        if len(hon)>=4: break
+
+    # 抑え：1着=上位3から、2-3着は上位4
+    osa = []
+    for x in order[:3]:
+        for y in order[:4]:
+            if y==x: continue
+            for z in order[:4]:
+                if z in (x,y): continue
+                pair = f"{x}-{y}-{z}"
+                if pair not in hon:
+                    osa.append(pair)
+                    if len(osa)>=3: break
+            if len(osa)>=3: break
+        if len(osa)>=3: break
+
+    # 狙い：中穴（4-5位を1着に絡める）
+    nerai = []
+    for x in order[3:5]:
+        for y in order[:3]:
+            if y==x: continue
+            for z in order[:4]:
+                if z in (x,y): continue
+                nerai.append(f"{x}-{y}-{z}")
+                if len(nerai)>=2: break
+            if len(nerai)>=2: break
+        if len(nerai)>=2: break
+
+    return hon, osa, nerai
+
+def render_card(place, rno, ymd, url, rows, narrative, hon, osa, nerai):
+    head = f"📍 {place} {rno}R ({ymd[:4]}/{ymd[4:6]}/{ymd[6:]})"
+    line = "――――――――――――――――"
+    body = [head, line, f"🧭 {narrative}", line, "———",]
+    body.append(f"🎯 本線：{', '.join(hon) if hon else '—'}")
+    body.append(f"🛡️ 抑え：{', '.join(osa) if osa else '—'}")
+    body.append(f"💥 狙い：{', '.join(nerai) if nerai else '—'}")
+    body.append(f"\n(直前情報 元: {url})")
+    return "\n".join(body)
+
+# ====== LINE handler ======
+HELP_TEXT = (
+"入力例：『丸亀 8』 / 『丸亀 8 20250811』\n"
+"'help' で使い方を表示します。"
+)
+
+def extract_url(text:str):
+    m = re.search(r"https?://\S+", text)
+    return m.group(0) if m else None
 
 @handler.add(MessageEvent, message=TextMessage)
 def on_message(event: MessageEvent):
-    user_text = (event.message.text or "").strip()
-    venue, rno, date = parse_user_text(user_text)
+    text = (event.message.text or "").strip()
 
-    if venue == "HELP":
-        reply(event.reply_token, HELP_TEXT)
+    # ヘルプ
+    if text.lower() in ("help","使い方"):
+        reply(event.reply_token, HELP_TEXT); return
+
+    # デバッグ（任意）
+    if text.startswith("debug"):
+        q = text.replace("debug","",1).strip()
+        url = extract_url(q)
+        if not url:
+            place, rno, ymd = parse_input(q)
+            if place and rno and place in JCD:
+                url = build_biyori_url(place, rno, ymd)
+        if not url:
+            reply(event.reply_token, "debug 使い方: debug 丸亀 8 20250811  または  debug <kyoteibiyori URL>"); return
+        try:
+            s = requests.Session(); s.headers.update(UA_HEADERS)
+            r = s.get(url, timeout=15, allow_redirects=True)
+            reply(event.reply_token, f"URL: {url}\nstatus: {r.status_code}\nlen: {len(r.text)}")
+        except Exception as e:
+            reply(event.reply_token, f"取得失敗: {e}")
         return
 
-    if not venue:
-        reply(event.reply_token, "入力例：『丸亀 8』 / 『丸亀 8 20250811』\n'help' で使い方を表示します。")
-        return
-
-    if venue not in JCD:
-        reply(event.reply_token, f"場名『{venue}』が見つかりません。例：丸亀、浜名湖、徳山…")
-        return
-    if not (1 <= rno <= 12):
-        reply(event.reply_token, "レース番号は 1〜12 を指定してください。")
-        return
+    # kyoteibiyori のURL直貼り対応
+    url = extract_url(text)
+    place=rno=ymd=None
+    if url and "kyoteibiyori.com" in url:
+        # URLに jcd, rno, hd が入っている場合は拾う（無くてもOK）
+        m_jcd = re.search(r"jcd=(\d{2})", url)
+        m_rno = re.search(r"rno=(\d{1,2})", url)
+        m_hd  = re.search(r"(?:hd|hiduke)=(20\d{6})", url)
+        if m_jcd:
+            for k,v in JCD.items():
+                if v==m_jcd.group(1): place=k; break
+        if m_rno: rno=int(m_rno.group(1))
+        if m_hd:  ymd=m_hd.group(1)
+        if not ymd: ymd = dt.datetime.now(JST).strftime("%Y%m%d")
+    else:
+        place, rno, ymd = parse_input(text)
+        if not (place and rno and place in JCD):
+            reply(event.reply_token, HELP_TEXT); return
+        url = build_biyori_url(place, rno, ymd)
 
     try:
-        pre = get_pre_race_info(venue, rno, date)
-        if not pre:
-            reply(event.reply_token, "直前情報の取得に失敗しました。少し待ってから再度お試しください。")
-            return
-
-        scenario, hon, osa, ner = build_prediction_from_preinfo(pre)
-
-        title = f"📍 {venue} {rno}R ({datetime.strptime(date,'%Y%m%d').strftime('%Y/%m/%d')})"
-        bar = "―" * 28
-        body_lines = [title, bar, f"🧭 展開予想：{scenario}", "", "――――", f"🎯 本線：{', '.join(hon)}",
-                      f"🛡️ 抑え：{', '.join(osa)}", f"💥 狙い：{', '.join(ner)}"]
-        src = pre.get("src", "")
-        url = pre.get("url")
-        if url:
-            body_lines.append(f"\n（直前情報 元：{url}）" if src == "biyori" else f"\n（直前情報 元：公式）")
-
-        reply(event.reply_token, "\n".join(body_lines))
-        # 軽い間隔（アクセス集中回避）
-        time.sleep(0.5)
+        html = fetch_biyori_preinfo(url)
+        rows = parse_biyori_table(html)
+        if len(rows) < 3:
+            raise RuntimeError("直前表の解析に失敗")
+        scores = build_scores(rows)
+        nar = make_narrative(rows, scores)
+        hon, osa, nerai = make_picks(scores)
+        card = render_card(place or "—", rno or 0, ymd, url, rows, nar, hon, osa, nerai)
+        reply(event.reply_token, card)
     except Exception as e:
-        traceback.print_exc()
-        reply(event.reply_token, "処理中にエラーが発生しました。時間をおいて再度お試しください。")
+        reply(event.reply_token, "直前情報の取得に失敗しました。少し待ってから再度お試しください。")
 
 def reply(token, text):
     line_bot_api.reply_message(token, TextSendMessage(text=text))
 
-# ========= エントリーポイント =========
 if __name__ == "__main__":
-    # Render では Procfile から gunicorn を使う想定。ローカル実行用に以下を有効化
-    port = int(os.getenv("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), debug=False)
