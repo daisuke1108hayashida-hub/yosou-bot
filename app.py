@@ -16,14 +16,14 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    raise RuntimeError("環境変数が不足しています: LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN")
+    raise RuntimeError("環境変数が不足: LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN")
 
-# ====== Flask / LINE SDK ======
+# ====== Flask / LINE ======
 app = Flask(__name__)
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# ====== 競艇場名 → place_no（ボートレース日和） ======
+# ====== 場コード（ボートレース日和） ======
 PLACE_NO = {
     "桐生": 1, "戸田": 2, "江戸川": 3, "平和島": 4, "多摩川": 5,
     "浜名湖": 6, "蒲郡": 7, "常滑": 8, "津": 9, "三国": 10,
@@ -39,180 +39,170 @@ def normalize_text(s: str) -> str:
     return unicodedata.normalize("NFKC", s).translate(FW_TO_HW).strip()
 
 def parse_user_input(text: str):
-    """
-    例:
-      丸亀 8
-      丸亀 8 20250811
-      唐津 12 20250811
-    をパースして (place_no, race_no, yyyymmdd) を返す
-    """
     t = normalize_text(text)
     m = re.match(r"^\s*(\S+)\s+(\d{1,2})(?:\s+(\d{8}))?\s*$", t)
     if not m:
         return None
-
     place_name, race_no, yyyymmdd = m.group(1), int(m.group(2)), m.group(3)
-
-    # 日付省略時は「今日」
     if not yyyymmdd:
-        yyyymmdd = datetime.utcnow() + timedelta(hours=9)  # JST
-        yyyymmdd = yyyymmdd.strftime("%Y%m%d")
-
-    # 場コード
+        yyyymmdd = (datetime.utcnow() + timedelta(hours=9)).strftime("%Y%m%d")
     place_no = PLACE_NO.get(place_name)
     if not place_no:
         return None
     return place_no, race_no, yyyymmdd, place_name
 
-# ====== 日和 直前情報スクレイパ ======
+# ====== 日和 直前情報取得（ロバスト版） ======
 def fetch_biyori_beforeinfo(place_no: int, race_no: int, yyyymmdd: str):
-    """
-    直前情報テーブル（展示/周回/周り足/直線/ST など）を取得して配列で返す。
-    返り値: list[dict] (1～6号艇の順) / 取得失敗時は None
-    """
     url = (
         f"https://kyoteibiyori.com/race_shusso.php"
         f"?place_no={place_no}&race_no={race_no}&hiduke={yyyymmdd}&slider=4"
     )
     headers = {
-        # Botブロックを避けるためブラウザっぽいUAとRefererを付与
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
                        "Chrome/120.0.0.0 Safari/537.36"),
-        "Referer": f"https://kyoteibiyori.com/",
+        "Referer": "https://kyoteibiyori.com/",
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
     }
 
     last_err = None
-    for i in range(3):
+    for attempt in range(3):
         try:
-            resp = requests.get(url, headers=headers, timeout=12)
-            if resp.status_code != 200:
-                last_err = f"status={resp.status_code}"
-                time.sleep(1.2 * (i + 1))
+            r = requests.get(url, headers=headers, timeout=12)
+            if r.status_code != 200:
+                last_err = f"status={r.status_code}"
+                time.sleep(1.0 * (attempt + 1))
                 continue
 
-            soup = BeautifulSoup(resp.text, "lxml")
+            soup = BeautifulSoup(r.text, "lxml")
 
-            # テーブルを特定：ヘッダに「展示」「周回」「周り足」「直線」「ST」などが並ぶものを探す
-            target_tbl = None
+            # ---- 1) 一番「それっぽい」テーブルを採点して選ぶ
+            KEYWORDS = ["展示", "展示タイム", "周回", "周り足", "直線", "ST", "スタート"]
+            best_tbl, best_score = None, -1
             for tbl in soup.find_all("table"):
-                ths = [th.get_text(strip=True) for th in tbl.find_all("th")]
-                header = "".join(ths)
-                if ("展示" in header or "展示タイム" in header) and "周回" in header and "直線" in header and "ST" in header:
-                    target_tbl = tbl
-                    break
+                txt = tbl.get_text(" ", strip=True)
+                score = sum(1 for k in KEYWORDS if k in txt)
+                # 行数・列数で少し加点（データテーブルっぽさ）
+                rows = tbl.find_all("tr")
+                if 6 <= len(rows) <= 12:
+                    score += 1
+                if score > best_score:
+                    best_score = score
+                    best_tbl = tbl
 
-            if not target_tbl:
+            if not best_tbl or best_score < 3:
                 last_err = "table-not-found"
-                time.sleep(1.2 * (i + 1))
+                time.sleep(1.0 * (attempt + 1))
                 continue
 
-            rows = target_tbl.find_all("tr")
-            data = []
-            # 1〜6号艇ぶん抽出（ヘッダ行をスキップ）
-            for tr in rows[1:7]:
+            # ---- 2) 見出し（th）から列インデックスを特定（表記ゆれ吸収）
+            header_map = {
+                "展示": "tenji", "展示ﾀｲﾑ": "tenji", "展示タイム": "tenji",
+                "周回": "shukai", "周回ﾀｲﾑ": "shukai",
+                "周り足": "mawari", "回り足": "mawari",
+                "直線": "chokusen",
+                "ST": "st", "ＳＴ": "st", "スタート": "st"
+            }
+            ths = [th.get_text(strip=True) for th in best_tbl.find_all("th")]
+            col_idx = {}
+            for idx, h in enumerate(ths):
+                for k, v in header_map.items():
+                    if k in h and v not in col_idx:
+                        col_idx[v] = idx
+
+            # ---- 3) 1～6号艇の行を読む（ヘッダ行の次を想定だが柔軟に）
+            rows = best_tbl.find_all("tr")
+            # ヘッダ行の位置（thが多い行）を推定
+            head_i = 0
+            for i, tr in enumerate(rows[:5]):
+                if tr.find("th"):
+                    head_i = i
+            data_rows = rows[head_i+1:head_i+7]
+
+            out = []
+            for tr in data_rows:
                 tds = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
                 if not tds:
                     continue
-                # ページ構造に左右されないよう、数値だけを柔軟に取得
-                # だいたい [選手名/級, 展示, 周回, 周り足, 直線, ST, …] の順に来る想定
-                # 数値カラムっぽいものだけ拾う
-                nums = [x for x in tds if re.search(r"\d", x)]
-                # 保険として長さチェック
-                info = {
-                    "tenji": None,
-                    "shukai": None,
-                    "mawari": None,
-                    "chokusen": None,
-                    "st": None,
-                    "raw": tds
-                }
-                # 見つかった順に当てはめ（表示順が違っても最低限値は拾える）
-                # ここはサイト変更に強めのゆるい割り当て
-                def pick(pattern):
-                    for x in nums:
-                        if re.search(pattern, x):
-                            return x
+
+                def get_by_col(name):
+                    if name in col_idx and col_idx[name] < len(tds):
+                        return tds[col_idx[name]]
                     return None
 
-                info["tenji"] = pick(r"^\d+\.\d+$")
-                info["shukai"] = pick(r"^\d+\.\d+$")
-                info["mawari"] = pick(r"^\d+\.\d+$")
-                info["chokusen"] = pick(r"^\d+\.\d+$")
-                info["st"] = pick(r"^F?\.?\d+$|^F\d+$")
+                rec = {
+                    "tenji": get_by_col("tenji"),
+                    "shukai": get_by_col("shukai"),
+                    "mawari": get_by_col("mawari"),
+                    "chokusen": get_by_col("chokusen"),
+                    "st": get_by_col("st"),
+                    "raw": tds,
+                }
 
-                data.append(info)
+                # フォールバック：数値らしいものを補完
+                if not rec["tenji"]:
+                    m = re.search(r"\d+\.\d+", " ".join(tds))
+                    rec["tenji"] = m.group(0) if m else None
+                if not rec["st"]:
+                    m = re.search(r"(?:F)?\d?\.\d+|F\d+", " ".join(tds))
+                    rec["st"] = m.group(0) if m else None
 
-            if len(data) >= 6:
-                return data
+                out.append(rec)
+
+            if len(out) >= 6:
+                return out
 
             last_err = "rows-short"
-            time.sleep(1.2 * (i + 1))
+            time.sleep(1.0 * (attempt + 1))
 
         except Exception as e:
             last_err = str(e)
-            time.sleep(1.2 * (i + 1))
+            time.sleep(1.0 * (attempt + 1))
 
     print(f"[biyori] fetch failed: url={url} err={last_err}")
     return None
 
 def build_prediction_from_biyori(binfo):
-    """
-    超シンプルな仮ロジック：
-    - 展示/直線が良い（値が速い＝小さい）艇を上位
-    - STが良い（数値小さい/Fは悪い）艇を加点
-    返り値: 展開テキスト, 本線/抑え/狙い（各3連単候補の簡易リスト）
-    """
     def to_float(x):
-        try:
-            return float(x)
-        except:
-            return None
+        try: return float(x)
+        except: return None
 
     scores = []
     for i, r in enumerate(binfo, start=1):
         tenji = to_float(r["tenji"])
         choku = to_float(r["chokusen"])
-        st = r["st"]
+        st_raw = r["st"]
         st_val = None
-        if st:
-            if st.startswith("F"):
-                st_val = 9.99  # 大減点
+        if st_raw:
+            if st_raw.startswith("F"):
+                st_val = 9.99
             else:
-                st_val = to_float(st.replace("F", "")) or 9.99
+                try:
+                    st_val = float(st_raw.replace("F", ""))
+                except:
+                    st_val = 9.99
         s = 0.0
-        if tenji: s += (7.00 - min(7.00, tenji)) * 10   # 例: 6.70で +3pt
-        if choku: s += (8.00 - min(8.00, choku)) * 5    # 例: 7.70で +1.5pt
-        if st_val is not None: s += (0.30 - min(0.30, st_val)) * 20  # 0.12で +3.6pt
-        scores.append((i, s, tenji, choku, st))
+        if tenji: s += (7.00 - min(7.00, tenji)) * 10
+        if choku: s += (8.00 - min(8.00, choku)) * 5
+        if st_val is not None: s += (0.30 - min(0.30, st_val)) * 20
+        scores.append((i, s))
 
     scores.sort(key=lambda x: x[1], reverse=True)
-    # ざっくり展開文
-    head = scores[0][0]
-    text = f"展開予想：①{head}の機力優位。本命は{head}中心。"
+    order = [x[0] for x in scores[:4]] or [1,2,3,4]
+    head = order[0]
 
-    # テンプレ買い目（超簡易）
-    order = [x[0] for x in scores[:4]]  # 上位4艇
-    if len(order) < 4:
-        # データ取れないときの保険
-        order = [1,2,3,4]
-
-    # 本線/抑え/狙い（例）
-    hon = [f"{order[0]}-{order[1]}-{order[2]}", f"{order[0]}-{order[2]}-{order[1]}"]
-    osa = [f"{order[1]}-{order[0]}-{order[2]}", f"{order[0]}-{order[1]}-{order[3]}"]
-    nerai = [f"{order[0]}-{order[3]}-{order[1]}", f"{order[3]}-{order[0]}-{order[1]}"]
-
-    return text, hon, osa, nerai
+    expo = f"展開予想：①{head}の機力優位。本命は{head}中心。"
+    hon  = [f"{order[0]}-{order[1]}-{order[2]}", f"{order[0]}-{order[2]}-{order[1]}"]
+    osa  = [f"{order[1]}-{order[0]}-{order[2]}", f"{order[0]}-{order[1]}-{order[3]}"]
+    nerai= [f"{order[0]}-{order[3]}-{order[1]}", f"{order[3]}-{order[0]}-{order[1]}"]
+    return expo, hon, osa, nerai
 
 def build_reply(place_name, race_no, yyyymmdd):
-    # 日和優先
     binfo = fetch_biyori_beforeinfo(PLACE_NO[place_name], race_no, yyyymmdd)
     if binfo:
         expo, hon, osa, nerai = build_prediction_from_biyori(binfo)
         url = (f"https://kyoteibiyori.com/race_shusso.php"
                f"?place_no={PLACE_NO[place_name]}&race_no={race_no}&hiduke={yyyymmdd}&slider=4")
-
         lines = []
         lines.append(f"📍 {place_name} {race_no}R（{datetime.strptime(yyyymmdd,'%Y%m%d').strftime('%Y/%m/%d')}）")
         lines.append("――――――――――――――――")
@@ -225,17 +215,14 @@ def build_reply(place_name, race_no, yyyymmdd):
         lines.append(f"(直前情報: 日和) {url}")
         return "\n".join(lines)
 
-    # 失敗したらエラーメッセージ
-    return "直前情報の取得に失敗しました。少し時間を空けてからもう一度お試しください。"
+    return "直前情報の取得に失敗しました。少し待ってから再度お試しください。"
 
 # ====== ルーティング ======
 @app.route("/health")
-def health():
-    return "ok", 200
+def health(): return "ok", 200
 
 @app.route("/")
-def index():
-    return "ok", 200
+def index(): return "ok", 200
 
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -250,9 +237,8 @@ def callback():
 @handler.add(MessageEvent, message=TextMessage)
 def on_message(event: MessageEvent):
     text = event.message.text.strip()
-
     if text.lower() in {"help", "ヘルプ"}:
-        msg = "入力例：『丸亀 8』 / 『唐津 12 20250811』\n日和の直前情報を使って簡易展開と買い目を返します。"
+        msg = "入力例：『丸亀 8』 / 『唐津 12 20250811』\n日和の直前情報で簡易展開と買い目を返します。"
         line_bot_api.reply_message(event.reply_token, TextSendMessage(msg))
         return
 
@@ -270,5 +256,4 @@ def on_message(event: MessageEvent):
 
 
 if __name__ == "__main__":
-    # 開発ローカル用（RenderはProcfileでgunicorn起動）
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
