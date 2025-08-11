@@ -1,3 +1,4 @@
+# app.py
 import os
 import re
 from datetime import datetime
@@ -7,38 +8,47 @@ from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
-from predictor import predict   # 予想関数がある前提
 
+# ====== Flask & LINE SDK 初期化 ======
 app = Flask(__name__)
 
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+
 if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    raise RuntimeError("環境変数 LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN を設定してください")
+    raise RuntimeError("環境変数 LINE_CHANNEL_SECRET と LINE_CHANNEL_ACCESS_TOKEN を設定してください。")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-JST = timezone(timedelta(hours=9))
+# ====== 便利関数 ======
+def reply_text(token: str, text: str) -> None:
+    line_bot_api.reply_message(token, TextSendMessage(text=text))
 
-# ボート場コード（jcd）
-JCD = {
-    "桐生":1,"戸田":2,"江戸川":3,"平和島":4,"多摩川":5,"浜名湖":6,
-    "蒲郡":7,"常滑":8,"津":9,"三国":10,"琵琶湖":11,"住之江":12,
-    "尼崎":13,"鳴門":14,"丸亀":15,"児島":16,"宮島":17,"徳山":18,
-    "下関":19,"若松":20,"芦屋":21,"福岡":22,"唐津":23,"大村":24
-}
+JST = ZoneInfo("Asia/Tokyo")
+USAGE = (
+    "使い方：\n"
+    "・『丸亀 8 20250808』のように送信（場名 レース番号 日付）\n"
+    "・日付は省略可（例：『丸亀 8』は今日の日付）\n"
+    "・ヘルプ：『help』または『使い方』"
+)
 
-def build_racecard_url(place: str, race_no: int, yyyymmdd: str | None) -> str:
-    jcd = JCD.get(place)
-    if not jcd:
-        raise ValueError("場名が認識できません")
-    if not (1 <= race_no <= 12):
-        raise ValueError("レース番号は1-12で指定してください")
-    if not yyyymmdd:
-        yyyymmdd = datetime.now(JST).strftime("%Y%m%d")
-    return f"https://www.boatrace.jp/owpc/pc/racedata/racecard?jcd={jcd}&hd={yyyymmdd}"
+# ====== 予想ロジック（まずはダミー） ======
+def predict(place: str, race_no: int, ymd: str) -> str:
+    """
+    本線/抑え/狙い を返すダミー。
+    あとでここを実データ（成績/直前情報）で置き換える。
+    """
+    # ここではサンプル固定返答
+    header = f"{place} {race_no}R（{ymd}）予想\n"
+    hon = "本線：1-2-全 / 1-全-2\n"
+    osa = "抑え：2-1-全\n"
+    ner = "狙い：4-1-2, 1-4-2\n"
+    tenkai = "展開：①スタート先手→2差し本線。4カド気配なら一撃注意。"
 
+    return header + "\n".join([hon, osa, ner, tenkai])
+
+# ====== ルーティング ======
 @app.route("/health")
 def health():
     return "ok", 200
@@ -57,62 +67,35 @@ def callback():
         abort(400)
     return "OK"
 
+# ====== メッセージ受信 ======
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event: MessageEvent):
-    text = event.message.text.strip()
+    raw = (event.message.text or "").strip()
 
-    # help
-    if text.lower() == "help":
-        msg = (
-            "使い方：\n"
-            "・『丸亀 8 20250808』のように送信（⽇付省略可。例：『丸亀 8』は今日）\n"
-            "→ 出走表URLを返します。"
-        )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+    # ヘルプ
+    if raw.lower() in ("help", "ヘルプ", "使い方"):
+        reply_text(event.reply_token, USAGE)
         return
 
-    # 「場名 数字(レース番号) [日付(任意8桁)]」のパターンに対応
-    import re
-    m = re.match(r"^(\S+)\s+(\d{1,2})(?:\s+(\d{8}))?$", text)
-    if m:
-        place, race_no, ymd = m.group(1), int(m.group(2)), m.group(3)
-        try:
-            url = build_racecard_url(place, race_no, ymd)
-            reply = f"出走表URL：{url}"
-        except Exception as e:
-            reply = f"エラー：{e}"
-    else:
-        reply = "コマンドが認識できません。『help』と送ると使い方を表示します。"
+    # 形式: 「場名 レース番号 [YYYYMMDD]」
+    # 例: 「丸亀 8 20250808」/「丸亀 8」
+    m = re.match(r"^(\S+?)\s*(\d{1,2})(?:\s+(\d{8}))?$", raw)
+    if not m:
+        reply_text(event.reply_token, "入力形式が違います。\n" + USAGE)
+        return
 
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+    place = m.group(1)
+    race_no = int(m.group(2))
+    ymd = m.group(3) or datetime.now(JST).strftime("%Y%m%d")
 
-if __name__ == "__main__":
-    # Render では Procfile で gunicorn を使うのでここは未使用
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
-
-# 先頭の import に追加
-from predictor import predict, build_racelist_url
-
-# handle_message 内の正規表現マッチ後の処理を差し替え
-m = re.match(r"^(\S+?)\s*(\d{1,2})(?:\s+(\d{8}))?$", text)
-if m:
-    place, race_no, ymd = m.group(1), int(m.group(2)), m.group(3)
     try:
         result = predict(place, race_no, ymd)
-        if not result["ok"]:
-            reply = f"⚠️ {result['message']}\n出走表URL：{result['url']}"
-        else:
-            reply = (
-                f"▶️ {place} {race_no}R 予想（自信度:{result['confidence']}）\n"
-                f"本線: {', '.join(result['main'])}\n"
-                f"押さえ: {', '.join(result['sub'])}\n"
-                f"狙い: {', '.join(result['attack']) if result['attack'] else '—'}\n"
-                f"展開: {result['comment']}\n"
-                f"出走表URL: {result['url']}"
-            )
     except Exception as e:
-        reply = f"エラー：{e}"
-else:
-    reply = "コマンドが認識できません。『help』を送ると使い方が出ます。"
+        result = f"予想中にエラーが発生しました：{e}"
 
-line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+    reply_text(event.reply_token, result)
+
+# ====== ローカル実行用（Renderでは不要） ======
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
