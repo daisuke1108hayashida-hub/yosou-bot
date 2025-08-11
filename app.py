@@ -1,15 +1,19 @@
 import os
 import re
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import json
+import datetime as dt
+
+import requests
+from bs4 import BeautifulSoup
 
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-from scraper import collect_all, build_urls, PLACE_CODE  # ← 取得＆予想
+from scraper import fetch_biyori, build_biyori_url, score_and_predict, format_beforeinfo
 
+# ---------------------- 基本設定 ----------------------
 app = Flask(__name__)
 
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
@@ -20,30 +24,25 @@ if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-JST = ZoneInfo("Asia/Tokyo")
+# 24場マップ（ボートレース日和のスラッグは推定。違う場合はここを直せばOK）
+STADIUM_SLUG = {
+    "桐生": "kiryu", "戸田": "toda", "江戸川": "edogawa", "平和島": "heiwajima", "多摩川": "tamagawa",
+    "浜名湖": "hamanako", "浜名": "hamanako", "蒲郡": "gamagori", "常滑": "tokoname", "津": "tsu",
+    "三国": "mikuni", "びわこ": "biwako", "琵琶湖": "biwako", "住之江": "suminoe", "尼崎": "amagasaki",
+    "鳴門": "naruto", "丸亀": "marugame", "児島": "kojima", "宮島": "miyajima", "徳山": "tokuyama",
+    "下関": "shimonoseki", "若松": "wakamatsu", "芦屋": "ashiya", "福岡": "fukuoka",
+    "唐津": "karatsu", "大村": "omura",
+}
 
-HELP = (
+HELP_TEXT = (
     "使い方：\n"
-    "・『丸亀 8 20250811』のように送信（場名 レース番号 日付）\n"
-    "・日付は省略可（『丸亀 8』→今日）\n"
-    "・返答：出走表URL＋直前サマリ＋本線/抑え/狙い＋展開\n"
-    "対応場：" + "、".join(PLACE_CODE.keys())
+    "・レース指定：『丸亀 8 20250808』のように送信（年月日は省略可。省略時は今日）\n"
+    "・リンク指定：ボートレース日和の『直前情報』ページURLをそのまま貼り付けでもOK\n"
+    "返す内容：本線／抑え／狙い と、展示・周回・周り足・直線・ST など直前情報の要約\n"
+    "例）『浜名湖 12』 / 『https://kyoteibiyori.com/...』 / 『help』"
 )
 
-def parse_input(text: str):
-    t = (text or "").strip().replace("　", " ")
-    if t.lower() in ("help", "ヘルプ", "使い方", "?"):
-        return ("__HELP__", None, None)
-    m = re.match(r"^\s*(\S+?)\s*([0-9１-９]{1,2})(?:\s+(\d{8}))?\s*$", t)
-    if not m:
-        return (None, None, None)
-    place = m.group(1)
-    rno = int(m.group(2).translate(str.maketrans("０１２３４５６７８９","0123456789")))
-    ymd = m.group(3) or datetime.now(JST).strftime("%Y%m%d")
-    if place not in PLACE_CODE or not (1 <= rno <= 12):
-        return (None, None, None)
-    return (place, rno, ymd)
-
+# ---------------------- ルーティング ----------------------
 @app.route("/health")
 def health():
     return "ok", 200
@@ -62,66 +61,125 @@ def callback():
         abort(400)
     return "OK"
 
+# ---------------------- テキスト処理 ----------------------
 @handler.add(MessageEvent, message=TextMessage)
-def handle_message(event: MessageEvent):
-    raw = event.message.text
-    place, rno, ymd = parse_input(raw)
+def on_message(event: MessageEvent):
+    text = (event.message.text or "").strip()
 
-    if place == "__HELP__":
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=HELP))
-        return
-    if not place:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="入力を理解できませんでした。\n" + HELP))
+    # help / 使い方
+    if text.lower() in ("help", "使い方", "ヘルプ"):
+        reply(event, HELP_TEXT)
         return
 
-    # 取得＋予想（エラー耐性あり）
+    # 1) URL が入っている場合（ボートレース日和直前ページを想定）
+    url = extract_url(text)
+    if url:
+        try:
+            beforeinfo = fetch_biyori(url)
+            if not beforeinfo:
+                reply(event, "直前情報の取得に失敗しました。URLが直前ページか確認してください。")
+                return
+            # 直前情報のみからスコア → 予想
+            ranks, picks = score_and_predict(beforeinfo)
+            msg = build_reply_text(ranks, picks, beforeinfo, note_head="📝URLから取得しました")
+            reply(event, msg)
+        except Exception as e:
+            reply(event, f"スクレイピングでエラー：{e}")
+        return
+
+    # 2) テキストから（場所 / レース番号 / 日付）
+    parsed = parse_query(text)
+    if not parsed:
+        reply(event, "読み取れませんでした。例）『丸亀 8 20250808』 or 直前ページURL / 『help』")
+        return
+
+    place, rno, ymd = parsed
+    slug = resolve_slug(place)
+    if not slug:
+        reply(event, f"場名『{place}』が分かりませんでした。『help』で一覧を確認して、短縮名は調整してください。")
+        return
+
+    # URL を組み立てて取得（URLパターンが違う場合は build_biyori_url() 内の一行を調整）
+    url = build_biyori_url(slug, rno, ymd)
     try:
-        data = collect_all(place, rno, ymd)   # dict
-        urls = build_urls(place, rno, ymd)    # dict
-
-        # 直前サマリ（展示タイム・チルト・風/波）
-        def fmt_float(x):
-            return f"{x:.2f}" if isinstance(x, float) else (x if x else "—")
-
-        tenji = data.get("tenji_times", [])
-        tilt  = data.get("tilts", [])
-        wind  = data.get("weather", {}).get("wind", "—")
-        wave  = data.get("weather", {}).get("wave", "—")
-        wthr  = data.get("weather", {}).get("weather", "—")
-        shinnyu = data.get("start_exhibit", "—")
-
-        # 予想（本線/抑え/狙い/展開）
-        pred = data.get("prediction", {})
-        main = pred.get("main", [])
-        sub  = pred.get("sub", [])
-        atk  = pred.get("attack", [])
-        cmt  = pred.get("comment", "—")
-        conf = pred.get("confidence", "C")
-
-        # 見やすい短文を組む
-        lines = []
-        lines.append(f"")
-        lines.append(f"出走表: {urls['racelist']}")
-        lines.append(f"直前: 展示T 1~6 = " + " / ".join(fmt_float(x) for x in tenji[:6]) )
-        lines.append(f"　　: チルト 1~6 = " + " / ".join(str(x) if x is not None else "—" for x in tilt[:6]))
-        lines.append(f"　　: 天候={wthr} 風={wind} 波={wave} 進入={shinnyu}")
-        lines.append("")
-        lines.append(f"本線: {', '.join(main) if main else '—'}")
-        lines.append(f"抑え: {', '.join(sub) if sub else '—'}")
-        lines.append(f"狙い: {', '.join(atk) if atk else '—'}")
-        lines.append(f"展開: {cmt}（自信度:{conf}）")
-
-        msg = "\n".join(lines)
-
+        beforeinfo = fetch_biyori(url)
+        if not beforeinfo:
+            reply(event, f"直前情報の取得に失敗しました。\nURLが合っているか確認してください。\n{url}")
+            return
+        ranks, picks = score_and_predict(beforeinfo)
+        head = f"⛵ {place} {rno}R {ymd}（{url}）"
+        msg = build_reply_text(ranks, picks, beforeinfo, note_head=head)
+        reply(event, msg)
     except Exception as e:
-        urls = build_urls(place, rno, ymd)
-        msg = (
-            f"データ取得でエラーが発生しました：{e}\n"
-            f"とりあえず出走表はこちら → {urls['racelist']}\n"
-            f"racecard: {urls['racecard']}"
-        )
+        reply(event, f"取得エラー：{e}\nURL: {url}")
 
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+# ---------------------- 返信組み立て ----------------------
+def build_reply_text(ranks, picks, beforeinfo, note_head=""):
+    lines = []
+    if note_head:
+        lines.append(note_head)
 
+    # 予想
+    main = picks.get("main", [])
+    cover = picks.get("cover", [])
+    aim = picks.get("aim", [])
+
+    def fseq(seq):  # [1,2,3] -> "1-2-3"
+        return "-".join(str(x) for x in seq)
+
+    lines.append("―― 予想（暫定）――")
+    if main:
+        lines.append("本線: " + " / ".join(fseq(s) for s in main))
+    if cover:
+        lines.append("抑え: " + " / ".join(fseq(s) for s in cover))
+    if aim:
+        lines.append("狙い: " + " / ".join(fseq(s) for s in aim))
+
+    # ランキング
+    order = [f"{i}号艇" for i in ranks]
+    lines.append("評価順: " + " > ".join(order))
+
+    # 直前情報の要約
+    lines.append("―― 直前要約 ――")
+    lines.extend(format_beforeinfo(beforeinfo))
+
+    lines.append("\n※簡易モデルです。重みは調整可能。『help』で使い方")
+    return "\n".join(lines)
+
+def reply(event, text):
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
+
+# ---------------------- ユーティリティ ----------------------
+def extract_url(s: str) -> str | None:
+    m = re.search(r"https?://\S+", s)
+    return m.group(0) if m else None
+
+def resolve_slug(place_tok: str) -> str | None:
+    # 完全一致優先 → 部分一致（先頭2文字など）
+    if place_tok in STADIUM_SLUG:
+        return STADIUM_SLUG[place_tok]
+    for k, v in STADIUM_SLUG.items():
+        if k.startswith(place_tok) or place_tok.startswith(k):
+            return v
+    return None
+
+def parse_query(text: str):
+    """
+    パターン: <場所> [<レース番号>] [<YYYYMMDD>]
+    例: '丸亀 8 20250808', '浜名湖 12', '住之江'
+    """
+    text = re.sub(r"\s+", " ", text.strip())
+    m = re.match(r"^(?P<place>\S+)(?:\s+(?P<rno>\d{1,2}))?(?:\s+(?P<ymd>\d{8}))?$", text)
+    if not m:
+        return None
+    place = m.group("place")
+    rno = int(m.group("rno")) if m.group("rno") else 12
+    if m.group("ymd"):
+        ymd = m.group("ymd")
+    else:
+        ymd = dt.date.today().strftime("%Y%m%d")
+    return place, rno, ymd
+
+# ----------------------------------------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), debug=False)
