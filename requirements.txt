@@ -3,4 +3,4 @@ gunicorn
 requests
 beautifulsoup4
 lxml
-line-bot-sdk>=3.8.0,<4.0
+line-bot-sdk
