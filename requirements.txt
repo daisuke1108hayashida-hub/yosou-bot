@@ -1,11 +1,5 @@
-flask>=3.0
-gunicorn>=21.2
-beautifulsoup4>=4.12
-lxml>=5.2
-httpx>=0.27
-
-# LINE SDK は v2 系の最終版に固定（app.py が v2 API のため）
-line-bot-sdk==2.4.3
-
-# 使っている場合のみ。不要なら消してOK
-openai==0.28.1
+Flask==3.0.3
+gunicorn==22.0.0
+line-bot-sdk==3.11.0
+requests==2.32.3
+beautifulsoup4==4.12.3
