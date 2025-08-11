@@ -85,3 +85,30 @@ def handle_message(event: MessageEvent):
 if __name__ == "__main__":
     # Render では Procfile で gunicorn を使うのでここは未使用
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+
+# 先頭の import に追加
+from predictor import predict, build_racelist_url
+
+# handle_message 内の正規表現マッチ後の処理を差し替え
+m = re.match(r"^(\S+?)\s*(\d{1,2})(?:\s+(\d{8}))?$", text)
+if m:
+    place, race_no, ymd = m.group(1), int(m.group(2)), m.group(3)
+    try:
+        result = predict(place, race_no, ymd)
+        if not result["ok"]:
+            reply = f"⚠️ {result['message']}\n出走表URL：{result['url']}"
+        else:
+            reply = (
+                f"▶️ {place} {race_no}R 予想（自信度:{result['confidence']}）\n"
+                f"本線: {', '.join(result['main'])}\n"
+                f"押さえ: {', '.join(result['sub'])}\n"
+                f"狙い: {', '.join(result['attack']) if result['attack'] else '—'}\n"
+                f"展開: {result['comment']}\n"
+                f"出走表URL: {result['url']}"
+            )
+    except Exception as e:
+        reply = f"エラー：{e}"
+else:
+    reply = "コマンドが認識できません。『help』を送ると使い方が出ます。"
+
+line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
