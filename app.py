@@ -20,6 +20,10 @@ handler = WebhookHandler(CHANNEL_SECRET)
 def health():
     return "ok", 200
 
+@app.route("/")
+def index():
+    return "ok", 200
+
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
