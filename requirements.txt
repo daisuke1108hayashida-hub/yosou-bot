@@ -1,13 +1,5 @@
-flask==3.0.3
-gunicorn==22.0.0
-
-# LINE Bot SDK v3 系（aiohttp依存を回避した実績レンジ）
+Flask==3.0.3
 line-bot-sdk==3.11.0
-
-# スクレイピング
-httpx==0.27.2
+requests==2.32.3
 beautifulsoup4==4.12.3
-lxml==5.2.2
-
-# 叙述文（任意）
-openai>=1.35.10
+gunicorn==22.0.0
