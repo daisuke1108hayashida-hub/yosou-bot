@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import os
 import re
+import logging
 import datetime as dt
 from typing import Dict, List, Tuple, Optional
 
@@ -19,7 +20,6 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import httpx
 from bs4 import BeautifulSoup
 
-
 # =========================
 # 基本設定
 # =========================
@@ -27,6 +27,7 @@ CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 
 app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
 
 handler = WebhookHandler(CHANNEL_SECRET)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
@@ -41,7 +42,6 @@ JCD = {
 
 Triplet = Tuple[int, int, int]
 
-
 # =========================
 # ユーティリティ
 # =========================
@@ -52,12 +52,6 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip())
 
 def parse_user_query(text: str) -> Tuple[Optional[str], Optional[int], str]:
-    """
-    入力例：
-      常滑 6 20250812
-      丸亀 8R
-      浜名湖 10 2025/08/12
-    """
     text = normalize(text)
     parts = text.replace("R"," ").replace("ｒ"," ").split(" ")
 
@@ -65,7 +59,7 @@ def parse_user_query(text: str) -> Tuple[Optional[str], Optional[int], str]:
     rno = None
     hd = today_str_jst()
 
-    # 場名を特定
+    # 場名
     for name in JCD.keys():
         if parts and (parts[0].startswith(name) or name in parts[0]):
             place = name
@@ -73,7 +67,7 @@ def parse_user_query(text: str) -> Tuple[Optional[str], Optional[int], str]:
             break
 
     # レース番号
-    for p in parts:
+    for p in list(parts):
         if re.fullmatch(r"\d{1,2}", p):
             rno = int(p)
             parts.remove(p)
@@ -93,20 +87,29 @@ def build_owpc_url(jcd: str, rno: int, hd: str) -> str:
 
 def fetch_owpc_meta(url: str) -> Dict:
     """
-    公式 beforeinfo から風速などをざっくり抽出（取れなければ空でOK）
+    公式 beforeinfo を取得。
+    HTML/XML を自動判別してパース。取れなくても空でOK。
     """
     meta: Dict = {}
     try:
-        with httpx.Client(timeout=10.0, headers={"User-Agent":"Mozilla/5.0"}) as cli:
+        with httpx.Client(
+            timeout=httpx.Timeout(10.0),
+            headers={"User-Agent":"Mozilla/5.0"},
+            follow_redirects=True,
+        ) as cli:
             r = cli.get(url)
             r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
+
+        text = r.text
+        head = text[:200].lstrip().lower()
+        # 先頭に XML 宣言があれば XML とみなす
+        parser = "lxml-xml" if head.startswith("<?xml") else "html.parser"
+        soup = BeautifulSoup(text, parser)
 
         # タイトル
-        title = soup.title.text.strip() if soup.title else ""
-        meta["title"] = title
+        meta["title"] = (soup.title.text.strip() if soup.title else "")
 
-        # 風速（ページ内のテキストから数字だけ拾う）
+        # 風速（ゆるく抽出）
         txt = soup.get_text(" ", strip=True)
         m = re.search(r"風速[^0-9]*([0-9]+)", txt)
         if m:
@@ -114,10 +117,11 @@ def fetch_owpc_meta(url: str) -> Dict:
                 meta["風速"] = int(m.group(1))
             except Exception:
                 pass
-    except Exception:
+
+    except Exception as e:
+        app.logger.exception("owpc fetch error: %s", e)
         meta["fetch_error"] = True
     return meta
-
 
 # =========================
 # 買い目ロジック
@@ -135,12 +139,6 @@ def unique_trios(items: List[Triplet]) -> List[Triplet]:
     return sorted(s, key=lambda x: (x[0], x[1], x[2]))
 
 def build_picks(meta: Dict) -> Dict[str, List[Triplet]]:
-    """
-    買い目ポリシー（濃いめ）:
-      本線 : 1-2-3456 / 1-3-2456 (+ 風強→1-4-流しを昇格)
-      押え : 2-1-345 / 2-3-145 / 1-4-流し（通常はこちら）
-      穴目 : 4-1-235 / 5-1-234
-    """
     main: List[Triplet] = []
     sub:  List[Triplet] = []
     ana:  List[Triplet] = []
@@ -156,7 +154,7 @@ def build_picks(meta: Dict) -> Dict[str, List[Triplet]]:
     except Exception:
         wind = 0.0
 
-    if wind >= 4:  # 追い風・向かい風問わず強めなら1-4筋を本線へ
+    if wind >= 4:
         main += one_four
     else:
         sub += one_four
@@ -171,7 +169,6 @@ def build_picks(meta: Dict) -> Dict[str, List[Triplet]]:
     sub  = unique_trios(sub)
     ana  = unique_trios(ana)
     return {"main": main, "sub": sub, "ana": ana}
-
 
 # =========================
 # 表示整形
@@ -211,7 +208,6 @@ def build_message(place: str, rno: int, hd: str, url: str, meta: Dict) -> str:
     ])
     return text
 
-
 # =========================
 # Flask ルーティング
 # =========================
@@ -227,57 +223,70 @@ def callback():
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
+    except Exception as e:
+        # どんな例外でも 200 を返して LINE 側の再試行ループを避ける
+        app.logger.exception("Exception on /callback: %s", e)
+        return "OK"
     return "OK"
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def on_message(event: MessageEvent):
-    text = (event.message.text or "").strip()
+    try:
+        text = (event.message.text or "").strip()
 
-    # help
-    if any(k in text.lower() for k in ["help", "ヘルプ", "使い方"]):
-        howto = (
-            "入力例：『常滑 6』 / 『丸亀 8 20250812』\n"
-            "形式：〈場名〉〈R〉〈任意:日付YYYYMMDD〉\n"
-            "※ 参考URLはBOATRACE公式の直前情報です。"
-        )
+        if any(k in text.lower() for k in ["help", "ヘルプ", "使い方"]):
+            howto = (
+                "入力例：『常滑 6』 / 『丸亀 8 20250812』\n"
+                "形式：〈場名〉〈R〉〈任意:日付YYYYMMDD〉\n"
+                "※ 参考URLはBOATRACE公式の直前情報です。"
+            )
+            line_api.reply_message(
+                ReplyMessageRequest(
+                    replyToken=event.reply_token,
+                    messages=[TextMessage(text=howto)]
+                )
+            )
+            return
+
+        place, rno, hd = parse_user_query(text)
+        if not place or not rno:
+            line_api.reply_message(
+                ReplyMessageRequest(
+                    replyToken=event.reply_token,
+                    messages=[TextMessage(text="入力例：『常滑 6』 / 『丸亀 8 20250812』\n→ 〈場名〉〈R〉〈日付(任意)〉の順で送ってください。")]
+                )
+            )
+            return
+
+        url = build_owpc_url(JCD[place], rno, hd)
+        meta = fetch_owpc_meta(url)
+
+        if meta.get("fetch_error"):
+            msg = (
+                f"📍 {place} {rno}R （{hd[:4]}/{hd[4:6]}/{hd[6:]}）\n"
+                f"直前情報の取得に失敗しました。少し待ってから再度お試しください。\n"
+                f"(src: 公式 / {url})"
+            )
+        else:
+            msg = build_message(place, rno, hd, url, meta)
+
         line_api.reply_message(
             ReplyMessageRequest(
                 replyToken=event.reply_token,
-                messages=[TextMessage(text=howto)]
+                messages=[TextMessage(text=msg)]
             )
         )
-        return
-
-    place, rno, hd = parse_user_query(text)
-    if not place or not rno:
+    except Exception as e:
+        app.logger.exception("on_message error: %s", e)
+        # フォールバック返信
         line_api.reply_message(
             ReplyMessageRequest(
                 replyToken=event.reply_token,
-                messages=[TextMessage(text="入力例：『常滑 6』 / 『丸亀 8 20250812』\n→ 〈場名〉〈R〉〈日付(任意)〉の順で送ってください。")]
+                messages=[TextMessage(text="処理中にエラーが出ました。少し待ってもう一度お試しください。")]
             )
         )
-        return
 
-    url = build_owpc_url(JCD[place], rno, hd)
-    meta = fetch_owpc_meta(url)
-
-    # 取得失敗時はURLだけ返す（既読確認に便利）
-    if meta.get("fetch_error"):
-        msg = f"📍 {place} {rno}R （{hd[:4]}/{hd[4:6]}/{hd[6:]}）\n" \
-              f"直前情報の取得に失敗しました。少し待ってから再度お試しください。\n" \
-              f"(src: 公式 / {url})"
-    else:
-        msg = build_message(place, rno, hd, url, meta)
-
-    line_api.reply_message(
-        ReplyMessageRequest(
-            replyToken=event.reply_token,
-            messages=[TextMessage(text=msg)]
-        )
-    )
-
-# デバッグ用：URL 直叩きで出力を確認
-# 例）/_debug/owpc?jcd=15&rno=8&hd=20250812
+# デバッグ：URL叩きで確認
 @app.get("/_debug/owpc")
 def debug_owpc():
     jcd = request.args.get("jcd", type=str)
@@ -286,7 +295,6 @@ def debug_owpc():
     if not jcd or not rno:
         return jsonify({"error":"params: jcd, rno[, hd]"}), 400
 
-    # 逆引きで場名を推定
     place = next((k for k,v in JCD.items() if v == jcd), f"JCD{jcd}")
     url = build_owpc_url(jcd, rno, hd)
     meta = fetch_owpc_meta(url)
@@ -294,8 +302,5 @@ def debug_owpc():
         return f"[owpc] fetch failed url={url}", 502
     return build_message(place, rno, hd, url, meta)
 
-
-# Render / gunicorn 用エントリ
 if __name__ == "__main__":
-    # ローカル実行用
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
