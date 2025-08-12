@@ -7,11 +7,13 @@ from collections import defaultdict
 from flask import Flask, request, abort, jsonify
 
 # ===== LINE v3 SDK =====
-from linebot.v3.webhooks import WebhookHandler, MessageEvent, TextMessageContent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhook import WebhookParser
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, TextMessage
 )
+from linebot.v3.exceptions import InvalidSignatureError
 
 # ===== Web / Parse =====
 import httpx
@@ -32,10 +34,11 @@ except Exception:
 # ===== LINE tokens =====
 CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-handler = WebhookHandler(CHANNEL_SECRET)
+
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 api_client = ApiClient(configuration)
 messaging_api = MessagingApi(api_client)
+parser = WebhookParser(CHANNEL_SECRET)
 
 app = Flask(__name__)
 
@@ -142,16 +145,11 @@ def join_trio(trios: List[Tuple[int,int,int]]) -> List[str]:
 # 集合表記への圧縮（例：1-23-3456）
 # ─────────────────────────────────────────
 def compress_trios_to_sets(trios: List[Tuple[int,int,int]]) -> List[str]:
-    """
-    1着固定ごとに、同じ「3着集合」を共有する2着集合を束ねて  a-bset-cset で出力。
-    """
     by_a: DefaultDict[int, DefaultDict[int, Set[int]]] = defaultdict(lambda: defaultdict(set))
     for a,b,c in trios:
         by_a[a][b].add(c)
-
     lines: List[str] = []
     for a, bmap in sorted(by_a.items()):
-        # 3着集合 → その集合を持つ 2着群
         inv: DefaultDict[frozenset, List[int]] = defaultdict(list)
         for b, cset in bmap.items():
             inv[frozenset(sorted(cset))].append(b)
@@ -163,7 +161,7 @@ def compress_trios_to_sets(trios: List[Tuple[int,int,int]]) -> List[str]:
     return lines
 
 # ─────────────────────────────────────────
-# beforeinfo 取得（簡易）
+# beforeinfo 取得
 # ─────────────────────────────────────────
 def beforeinfo_url(jcd: str, rno: int, hd: str) -> str:
     return f"https://www.boatrace.jp/owpc/pc/race/beforeinfo?rno={rno}&jcd={jcd}&hd={hd}"
@@ -177,8 +175,6 @@ def fetch_beforeinfo(jcd: str, rno: int, hd: str) -> Dict:
     url = beforeinfo_url(jcd, rno, hd)
     r = http.get(url); r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-
-    # 展示タイムのざっくり抽出（構造変更に弱い点は了承）
     tenji_times = {}
     for tr in soup.select("table.is-tableFixed__3rdadd tr"):
         tds = tr.find_all("td")
@@ -188,14 +184,13 @@ def fetch_beforeinfo(jcd: str, rno: int, hd: str) -> Dict:
                 tenji = tds[-1].get_text(strip=True)
                 tenji = float(tenji) if re.fullmatch(r"\d+\.\d", tenji) else None
                 if tenji: tenji_times[waku] = tenji
-            except:  # noqa
+            except:
                 pass
-
     ranking = sorted(tenji_times.items(), key=lambda x: x[1]) if tenji_times else []
     return {"url": url, "tenji_times": tenji_times, "tenji_rank": [w for w,_ in ranking]}
 
 # ─────────────────────────────────────────
-# 予想（点数は控えめ、集合で出力）
+# 予想
 # ─────────────────────────────────────────
 def pick_predictions(info: Dict) -> Dict[str, List[Tuple[int,int,int]]]:
     rank = info.get("tenji_rank", [])
@@ -203,21 +198,16 @@ def pick_predictions(info: Dict) -> Dict[str, List[Tuple[int,int,int]]]:
     base2 = rank[1] if len(rank)>=2 else 2
     base3 = rank[2] if len(rank)>=3 else 3
 
-    # 内本線（1頭 or 展示1位頭）
     main = dedup_trio([
         (base1, base2, x) for x in [3,4,5,6] if x not in {base1,base2}
     ] + [
         (base1, base3, x) for x in [2,4,5,6] if x not in {base1,base3}
     ])
-
-    # 押え：2の差し・3のまくり差し側
     osa = dedup_trio([
         (base2, base1, x) for x in [3,4,5,6] if x not in {base1,base2}
     ] + [
         (base3, base1, x) for x in [2,4,5,6] if x not in {base1,base3}
     ])
-
-    # 穴：4/5/6の一撃→1残し
     ana = dedup_trio([
         (4,1,x) for x in [2,3,5,6] if x not in {1,4}
     ] + [
@@ -235,24 +225,23 @@ def format_prediction_block(pred: Dict) -> str:
         if not trios: continue
         label = {"main":"本線","osa":"押え","ana":"穴目"}[title]
         line_sets = compress_trios_to_sets(trios)
-        # 行数はコンパクト、カッコ内は合計点
         head = f"{label}（{len(trios)}点）"
         blocks.append("\n".join([head] + line_sets))
     return "\n\n".join(blocks)
 
 # ─────────────────────────────────────────
-# 叙述（濃いめ）。GPTが無ければルールベースで3〜4文。
+# 叙述
 # ─────────────────────────────────────────
 def build_narrative(place: str, rno: int, info: Dict) -> str:
     if USE_GPT and _OPENAI_OK and os.getenv("OPENAI_API_KEY"):
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         sys = (f"あなたは競艇の予想コメントを書く解説者。言語は{NARRATIVE_LANG}。"
-               "180〜260文字で、具体的な根拠（展示上位、進入想定は内有利前提など）を簡潔に。"
+               "180〜260文字で、具体的根拠（展示上位、進入は内有利前提など）を簡潔に。"
                "同じ語尾の連続を避け、買い目の狙い所を最後にまとめる。")
         user = {
             "place":place, "race":rno,
             "tenji_rank": info.get("tenji_rank", []),
-            "policy": "展示上位を厚め。内1本線、2差し・3まくり差しケア、外は展開待ち。"
+            "policy": "展示上位厚め。1本線、2差し・3まくり差しケア、外は展開待ち。"
         }
         try:
             res = client.chat.completions.create(
@@ -266,37 +255,40 @@ def build_narrative(place: str, rno: int, info: Dict) -> str:
         except Exception as e:
             print("[gpt] error:", e)
 
-    # ルールベース
     rank = info.get("tenji_rank", [])
-    top = "・展示計測が未取得のため内基本線。" if not rank else f"・展示上位は{','.join(map(str,rank[:3]))}番。"
+    top = "展示計測未取得のため内基本線。" if not rank else f"展示上位は{','.join(map(str,rank[:3]))}番。"
     msg = [
-        f"{place}{rno}Rの展望。",
-        top,
-        "・1の先マイ本線。2は差しで内差詰、3はまくり差しの形で怖い。",
-        "・外は4→5→6の評価。スタ展次第で一撃なら4-1型。"
+        f"{place}{rno}Rの展望。", top,
+        "1の先マイ本線。2は差しで内差詰、3はまくり差しの形で怖い。",
+        "外は4→5→6の序列。スタ展次第で一撃は4-1型まで。"
     ]
     return " ".join(msg)
 
 # ─────────────────────────────────────────
-# LINE Webhook
+# LINE Webhook（v3は WebhookParser を使う）
 # ─────────────────────────────────────────
-@app.route("/callback", methods=["POST"])
+@app.post("/callback")
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     try:
-        handler.handle(body, signature)
+        events = parser.parse(body, signature)
+    except InvalidSignatureError:
+        return "invalid signature", 400
     except Exception as e:
-        print("[/callback] handle error:", e); abort(400)
+        print("[parse] error:", e); return "error", 400
+
+    for event in events:
+        if isinstance(event, MessageEvent) and isinstance(event.message, TextMessageContent):
+            handle_text_message(event)
     return "OK"
 
-@handler.add(MessageEvent, message=TextMessageContent)
-def on_message(event: MessageEvent):
+def handle_text_message(event: MessageEvent):
     text = event.message.text.strip()
     parsed = parse_user_text(text)
     if not parsed:
         reply(event.reply_token,
-              "例）「常滑 6 20250812」/「丸亀 9」。\n展開だけなら「1-4-235」「45-1=235」「4-12-3」。")
+              "例）「常滑 6 20250812」/「丸亀 9」\n展開だけなら「1-4-235」「45-1=235」「4-12-3」。")
         return
 
     if parsed["mode"]=="shorthand":
@@ -321,7 +313,6 @@ def on_message(event: MessageEvent):
     preds = pick_predictions(info)
     url = info.get("url", beforeinfo_url(jcd, rno, hd))
     nar = build_narrative(place, rno, info)
-
     header = "――――――――――――――――\n"
     head2 = f"{nar}\n（参考: {url}）\n"
     block = format_prediction_block(preds)
@@ -335,9 +326,7 @@ def reply(reply_token: str, text: str):
     except Exception as e:
         print("[reply] error:", e)
 
-# ─────────────────────────────────────────
 # health
-# ─────────────────────────────────────────
 @app.get("/healthz")
 def healthz(): return jsonify(ok=True)
 
