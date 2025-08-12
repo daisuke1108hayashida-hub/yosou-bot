@@ -1,11 +1,6 @@
-# Web
 flask==3.0.3
 gunicorn==22.0.0
-
-# LINE Bot SDK（v3系）…aiohttpはSDKが適切版を引くので固定しない
 line-bot-sdk==3.11.0
-
-# スクレイピング
 httpx==0.27.2
 beautifulsoup4==4.12.3
 lxml==5.2.2
