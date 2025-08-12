@@ -1,337 +1,478 @@
 import os
 import re
+import math
 import datetime as dt
-from typing import List, Tuple, Dict, Set, DefaultDict
-from collections import defaultdict
+from typing import List, Dict, Tuple, Set
 
-from flask import Flask, request, abort, jsonify
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, request, abort
 
-# ===== LINE v3 SDK =====
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
-from linebot.v3.webhook import WebhookParser
+# ==== LINE v3 SDK ====
+from linebot.v3 import WebhookParser
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, TextMessage
 )
-from linebot.v3.exceptions import InvalidSignatureError
 
-# ===== Web / Parse =====
-import httpx
-from bs4 import BeautifulSoup
-
-# ===== (任意) OpenAI =====
+# ==== GPT (任意) ====
 USE_GPT = os.getenv("USE_GPT_NARRATIVE", "false").lower() == "true"
 GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
 GPT_TEMP = float(os.getenv("GPT_TEMPERATURE", "0.2"))
 NARRATIVE_LANG = os.getenv("NARRATIVE_LANG", "ja")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-try:
-    from openai import OpenAI  # openai>=1.x
-    _OPENAI_OK = True
-except Exception:
-    _OPENAI_OK = False
+if USE_GPT and OPENAI_API_KEY:
+    import openai
+    openai.api_key = OPENAI_API_KEY
 
-# ===== LINE tokens =====
-CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 
-configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+# -------------------------
+# 基本設定
+# -------------------------
+LINE_SECRET = os.environ["LINE_CHANNEL_SECRET"]
+LINE_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+
+configuration = Configuration(access_token=LINE_TOKEN)
 api_client = ApiClient(configuration)
-messaging_api = MessagingApi(api_client)
-parser = WebhookParser(CHANNEL_SECRET)
+line_api = MessagingApi(api_client)
+parser = WebhookParser(LINE_SECRET)
 
 app = Flask(__name__)
 
-# ─────────────────────────────────────────
-# 会場コード
-# ─────────────────────────────────────────
+# 場コード（jcd）
 JCD = {
-    "桐生":"01","戸田":"02","江戸川":"03","平和島":"04","多摩川":"05",
-    "浜名湖":"06","蒲郡":"07","常滑":"08","津":"09","三国":"10",
-    "びわこ":"11","住之江":"12","尼崎":"13","鳴門":"14","丸亀":"15",
-    "児島":"16","宮島":"17","徳山":"18","下関":"19","若松":"20",
-    "芦屋":"21","福岡":"22","唐津":"23","大村":"24",
-}
-KANA = {
-    "きりゅう":"桐生","とだ":"戸田","えどがわ":"江戸川","へいわじま":"平和島","たまがわ":"多摩川",
-    "はまなこ":"浜名湖","がまごおり":"蒲郡","とこなめ":"常滑","つ":"津","みくに":"三国",
-    "びわこ":"びわこ","すみのえ":"住之江","あまがさき":"尼崎","なると":"鳴門","まるがめ":"丸亀",
-    "こじま":"児島","みやじま":"宮島","とくやま":"徳山","しものせき":"下関","わかまつ":"若松",
-    "あしや":"芦屋","ふくおか":"福岡","からつ":"唐津","おおむら":"大村",
+    "桐生": "01", "戸田": "02", "江戸川": "03", "平和島": "04", "多摩川": "05",
+    "浜名湖": "06", "蒲郡": "07", "常滑": "08", "津": "09", "三国": "10",
+    "びわこ": "11", "住之江": "12", "尼崎": "13", "鳴門": "14", "丸亀": "15",
+    "児島": "16", "宮島": "17", "徳山": "18", "下関": "19", "若松": "20",
+    "芦屋": "21", "福岡": "22", "唐津": "23", "大村": "24"
 }
 
-# ─────────────────────────────────────────
-# 入力解釈 & shorthand 展開
-# ─────────────────────────────────────────
+HEAD = {
+    "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/125 Safari/537.36"
+}
+
+# -------------------------
+# ユーティリティ
+# -------------------------
+def today_yyyymmdd(tz="Asia/Tokyo"):
+    JST = dt.timezone(dt.timedelta(hours=9))
+    return dt.datetime.now(JST).strftime("%Y%m%d")
+
+def build_beforeinfo_url(jcd: str, rno: int, ymd: str) -> str:
+    return f"https://www.boatrace.jp/owpc/pc/race/beforeinfo?rno={rno}&jcd={jcd}&hd={ymd}"
+
+def safe_get(url: str) -> str:
+    r = requests.get(url, headers=HEAD, timeout=12)
+    r.raise_for_status()
+    return r.text
+
 def parse_user_text(text: str):
-    s = text.strip().replace("　", " ")
-    if "-" in s or "=" in s:
-        return {"mode":"shorthand","expr":s}
-    parts = [p for p in s.split() if p]
-    if not parts: return None
-    place_raw = parts[0]
-    place = KANA.get(place_raw, place_raw)
-    if place not in JCD: return None
-    rno = int(parts[1]) if len(parts)>=2 and parts[1].isdigit() else 12
-    if len(parts)>=3 and re.fullmatch(r"\d{8}", parts[2]):
-        hd = parts[2]
+    """
+    入力例:
+      '常滑 8 20250812'
+      '浜名湖 10'
+      '08 6 20250812' など数字場も可
+    """
+    t = text.strip().replace("　", " ")
+    parts = [p for p in re.split(r"\s+", t) if p]
+    if len(parts) < 2:
+        raise ValueError("入力は『場名 レース番号 [YYYYMMDD]』の形式でお願いします。")
+
+    place_raw, race_raw = parts[0], parts[1]
+    if place_raw in JCD:
+        jcd = JCD[place_raw]
+        place = place_raw
+    elif re.fullmatch(r"\d{2}", place_raw):
+        jcd = place_raw
+        place = [k for k, v in JCD.items() if v == jcd]
+        place = place[0] if place else place_raw
     else:
-        jst = dt.datetime.utcnow() + dt.timedelta(hours=9)
-        hd = jst.strftime("%Y%m%d")
-    return {"mode":"race","place":place,"jcd":JCD[place],"rno":rno,"hd":hd}
+        # 前方一致でも拾う
+        hit = [k for k in JCD if k.startswith(place_raw)]
+        if not hit:
+            raise ValueError("場名が認識できません。")
+        place = hit[0]; jcd = JCD[place]
 
-DIGITS = set("123456")
-def _set_from_token(tok: str) -> List[int]:
-    return [int(c) for c in tok if c in DIGITS]
+    rno = int(re.sub(r"\D", "", race_raw))
+    ymd = parts[2] if len(parts) >= 3 else today_yyyymmdd()
+    if not re.fullmatch(r"\d{8}", ymd):
+        raise ValueError("日付はYYYYMMDDで指定してください。")
 
-def dedup_trio(trios: List[Tuple[int,int,int]]) -> List[Tuple[int,int,int]]:
-    seen=set(); out=[]
-    for t in trios:
-        if len({t[0],t[1],t[2]})!=3: continue
-        if t not in seen:
-            seen.add(t); out.append(t)
+    return place, jcd, rno, ymd
+
+# -------------------------
+# スクレイプ & スコアリング
+# -------------------------
+def scrape_beforeinfo(jcd: str, rno: int, ymd: str) -> Dict:
+    """
+    beforeinfo から展示タイム、ST近辺、進入枠、FL情報などを可能な範囲で取得。
+    ページ側の構成変化に強いよう、見出しのキーワードで探す。
+    戻り値: dict { boat_no: {...指標...} }
+    """
+    url = build_beforeinfo_url(jcd, rno, ymd)
+    html = safe_get(url)
+    soup = BeautifulSoup(html, "lxml")  # HTMLとして扱う
+
+    data = {i: {} for i in range(1, 7)}
+
+    # 展示タイム
+    # 見出し「展示タイム」「直前情報」に近い table をざっくり探索
+    def try_float(x):
+        try:
+            return float(x)
+        except:
+            return None
+
+    # テーブルの数値を総当たりで拾っていく（多少強引だが堅牢）
+    for tbl in soup.find_all("table"):
+        th_text = " ".join(th.get_text(strip=True) for th in tbl.find_all("th"))
+        td_text = " ".join(td.get_text(strip=True) for td in tbl.find_all("td"))
+        context = th_text + " " + td_text
+
+        # 展示
+        if "展示" in context and "タイム" in context:
+            rows = tbl.find_all("tr")
+            for tr in rows:
+                tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+                if len(tds) >= 2:
+                    # 先頭が号艇 or 枠
+                    no = re.sub(r"\D", "", tds[0])
+                    if no.isdigit():
+                        b = int(no)
+                        # 数値らしきものを抽出して最小を採用（xx.xx）
+                        nums = [try_float(x.replace("−", "-")) for x in tds[1:]]
+                        nums = [n for n in nums if n is not None and 4.0 < n < 9.0]
+                        if nums:
+                            data[b]["exh"] = min(nums)
+
+        # ST近辺
+        if "ST" in context and ("コンマ" in context or "近辺" in context or "タイミング" in context):
+            # 号艇順に ST値が並ぶ table が多いので、0.0x の値を順に拾う
+            st_nums = re.findall(r"0\.\d{2}", context)
+            if len(st_nums) >= 6:
+                for i in range(6):
+                    v = float(st_nums[i])
+                    data[i+1]["st"] = v
+
+        # 進入想定（枠）…beforeinfoは基本枠なりだが、入れ替えがあれば記載される
+        if "進入" in context and ("コース" in context or "枠" in context):
+            # 明確に拾えなければ枠なり
+            pass
+
+        # F/L
+        if "F" in context or "L" in context or "フライング" in context:
+            # 「F1」「FL」等をざっくり拾う
+            f_words = re.findall(r"F\d|FL|L\d", context)
+            if f_words:
+                # 見つかった場合は一律リスク+（どの艇かまで割り当て不能なことが多いので全体軽微）
+                for i in range(1,7):
+                    data[i]["fl_flag"] = True
+
+    # 足りないところは None を入れておく
+    for i in range(1,7):
+        data[i].setdefault("exh", None)
+        data[i].setdefault("st", None)
+        data[i].setdefault("fl_flag", False)
+
+    return {"url": build_beforeinfo_url(jcd, rno, ymd), "boats": data}
+
+
+def score_boats(info: Dict) -> Dict[int, float]:
+    """
+    単純化したスコアリング:
+      ・枠有利: 1>2>3>4>5>6
+      ・展示タイム: 良いほど加点
+      ・ST: 早いほど加点（0.10基準）
+      ・F/Lがページに見えたら少し減点
+    """
+    lane_bias = {1: 25, 2: 15, 3: 8, 4: 2, 5: -2, 6: -5}
+    boats = info["boats"]
+    # 正規化用
+    exh_vals = [v["exh"] for v in boats.values() if v["exh"]]
+    st_vals  = [v["st"]  for v in boats.values() if v["st"]]
+
+    min_exh = min(exh_vals) if exh_vals else None
+    max_exh = max(exh_vals) if exh_vals else None
+    ref_st = 0.10
+
+    score = {}
+    for b in range(1,7):
+        s = lane_bias[b]
+
+        # 展示
+        ev = boats[b]["exh"]
+        if ev and min_exh and max_exh and max_exh > min_exh:
+            # 速いほど +5 まで
+            norm = (max_exh - ev) / (max_exh - min_exh)
+            s += 5 * norm
+
+        # ST
+        st = boats[b]["st"]
+        if st:
+            s += max(0, 6 - (st - ref_st)*100) * 0.2  # 0.10に近いほど加点（ゆるい）
+
+        if boats[b]["fl_flag"]:
+            s -= 1.0
+
+        score[b] = s
+
+    return score
+
+# -------------------------
+# 3連単候補生成と「まとめ表記」
+# -------------------------
+def unique_triples(triples: List[Tuple[int,int,int]]) -> List[Tuple[int,int,int]]:
+    seen = set()
+    out = []
+    for a,b,c in triples:
+        if a==b or b==c or a==c:  # 同着禁止
+            continue
+        key = (a,b,c)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
     return out
 
-def expand_shorthand(expr: str) -> List[Tuple[int,int,int]]:
-    s = expr.replace(" ", "")
-    if "-" not in s: return []
-    tokens = s.split("-")
-    out: List[Tuple[int,int,int]] = []
-    if len(tokens)==2 and "=" in tokens[1]:
-        A=_set_from_token(tokens[0]); m=tokens[1].split("=")
-        if len(m)!=2: return []
-        fixed=_set_from_token(m[0]); others=_set_from_token(m[1])
-        for a in A:
-            for f in fixed:
-                for o in others:
-                    if len({a,f,o})==3:
-                        out.append((a,f,o)); out.append((a,o,f))
-        return dedup_trio(out)
+def expand_groups(first: Set[int], seconds: Set[int], thirds: Set[int]) -> List[Tuple[int,int,int]]:
+    triples = []
+    for f in first:
+        for s in seconds:
+            for t in thirds:
+                triples.append((f,s,t))
+    return unique_triples(triples)
 
-    if len(tokens)==3:
-        A,B,C = tokens
-        if "=" in B:
-            b1,b2 = (_set_from_token(x) for x in B.split("="))
-            A=_set_from_token(A); C=_set_from_token(C)
-            for a in A:
-                for x in b1:
-                    for y in b2:
-                        if len({a,x,y})==3:
-                            for c in C:
-                                if c not in {a,x,y}: out.append((a,x,c)); out.append((a,y,c))
-            return dedup_trio(out)
-        if "=" in C:
-            c1,c2 = (_set_from_token(x) for x in C.split("="))
-            A=_set_from_token(A); B=_set_from_token(B)
-            for a in A:
-                for b in B:
-                    for x in c1:
-                        if x not in {a,b}: out.append((a,b,x))
-                    for y in c2:
-                        if y not in {a,b}: out.append((a,b,y))
-            return dedup_trio(out)
-        A=_set_from_token(A); B=_set_from_token(B); C=_set_from_token(C)
-        for a in A:
-            for b in B:
-                for c in C:
-                    if len({a,b,c})==3: out.append((a,b,c))
-        return dedup_trio(out)
-    return []
+def format_group(fset: Set[int], sset: Set[int], tset: Set[int]) -> str:
+    a = "".join(str(i) for i in sorted(fset))
+    b = "".join(str(i) for i in sorted(sset))
+    c = "".join(str(i) for i in sorted(tset))
+    return f"{a}-{b}-{c}"
 
-def join_trio(trios: List[Tuple[int,int,int]]) -> List[str]:
-    return [f"{a}-{b}-{c}" for (a,b,c) in trios]
+def compress_triples(first: int, triples: List[Tuple[int,int,int]]) -> List[str]:
+    """
+    与えられた first について、(second, third) の存在行列から
+    “完全な長方形”を貪欲に抜き出して 1-23-3456 のように圧縮。
+    残りは個別 1-2-3 で出す。
+    """
+    # second, third の集合
+    pairs = [(b,c) for (a,b,c) in triples if a == first]
+    if not pairs:
+        return []
 
-# ─────────────────────────────────────────
-# 集合表記への圧縮（例：1-23-3456）
-# ─────────────────────────────────────────
-def compress_trios_to_sets(trios: List[Tuple[int,int,int]]) -> List[str]:
-    by_a: DefaultDict[int, DefaultDict[int, Set[int]]] = defaultdict(lambda: defaultdict(set))
-    for a,b,c in trios:
-        by_a[a][b].add(c)
-    lines: List[str] = []
-    for a, bmap in sorted(by_a.items()):
-        inv: DefaultDict[frozenset, List[int]] = defaultdict(list)
-        for b, cset in bmap.items():
-            inv[frozenset(sorted(cset))].append(b)
-        for cset, blist in sorted(inv.items(), key=lambda x: ("".join(map(str,sorted(x[0]))), sorted(x[1]))):
-            bset = "".join(map(str, sorted(blist)))
-            cset_s = "".join(map(str, sorted(cset)))
-            if bset and cset_s:
-                lines.append(f"{a}-{bset}-{cset_s}")
+    seconds = sorted(set(b for b,_ in pairs))
+    thirds  = sorted(set(c for _,c in pairs))
+
+    # 存在表
+    has = {(b,c) for b,c in pairs}
+
+    used = set()
+    lines = []
+
+    remain_pairs = set(pairs)
+
+    while remain_pairs:
+        # 度数が高い second を起点に最大共通 third 群を探す
+        deg = {}
+        for b in seconds:
+            deg[b] = sum((b,c) in remain_pairs for c in thirds)
+        base = max(seconds, key=lambda x: deg.get(x,0))
+        if deg.get(base,0) <= 1:
+            break
+
+        # base を含む seconds の候補（共通 third が2つ以上になる範囲）
+        cand_seconds = [b for b in seconds if b!=base and any((b,c) in remain_pairs for c in thirds)]
+        group_seconds = {base}
+        common_thirds = {c for c in thirds if (base,c) in remain_pairs}
+
+        for b in cand_seconds:
+            bt = {c for c in thirds if (b,c) in remain_pairs}
+            inter = common_thirds & bt
+            if len(inter) >= 2:
+                group_seconds.add(b)
+                common_thirds = inter
+
+        if len(group_seconds) >= 2 and len(common_thirds) >= 2:
+            # 長方形として採用
+            for b in list(group_seconds):
+                for c in list(common_thirds):
+                    remain_pairs.discard((b,c))
+            lines.append(format_group({first}, set(group_seconds), set(common_thirds)))
+        else:
+            # 長方形にならない → 個別に一つ吐く
+            b,c = next(iter(remain_pairs))
+            remain_pairs.remove((b,c))
+            lines.append(f"{first}-{b}-{c}")
+
+    # 残りを個別で
+    for b,c in sorted(remain_pairs):
+        lines.append(f"{first}-{b}-{c}")
+
     return lines
 
-# ─────────────────────────────────────────
-# beforeinfo 取得
-# ─────────────────────────────────────────
-def beforeinfo_url(jcd: str, rno: int, hd: str) -> str:
-    return f"https://www.boatrace.jp/owpc/pc/race/beforeinfo?rno={rno}&jcd={jcd}&hd={hd}"
+def make_ticket_sets(scores: Dict[int, float]):
+    """
+    スコア上位から本線/押え/穴 の“候補のかたまり”を返す。
+    1着は基本1枠寄り、対抗に2-3、3着に残り といった型にしつつ
+    スコアで動的に入替。
+    """
+    ranks = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    top = [r[0] for r in ranks]  # 号艇順位
 
-http = httpx.Client(headers={
-    "User-Agent":"Mozilla/5.0 (Bot; +https://render.com)",
-    "Accept-Language":"ja,en;q=0.8",
-}, timeout=15)
+    # ざっくりロジック
+    fav = top[0]
+    seconds = set(top[1:3])  # 2頭目候補
+    thirds  = set(i for i in range(1,7)) - {fav}  # 3着候補
 
-def fetch_beforeinfo(jcd: str, rno: int, hd: str) -> Dict:
-    url = beforeinfo_url(jcd, rno, hd)
-    r = http.get(url); r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    tenji_times = {}
-    for tr in soup.select("table.is-tableFixed__3rdadd tr"):
-        tds = tr.find_all("td")
-        if len(tds) >= 7:
-            try:
-                waku = int(tds[0].get_text(strip=True))
-                tenji = tds[-1].get_text(strip=True)
-                tenji = float(tenji) if re.fullmatch(r"\d+\.\d", tenji) else None
-                if tenji: tenji_times[waku] = tenji
-            except:
-                pass
-    ranking = sorted(tenji_times.items(), key=lambda x: x[1]) if tenji_times else []
-    return {"url": url, "tenji_times": tenji_times, "tenji_rank": [w for w,_ in ranking]}
+    main = expand_groups({fav}, seconds, thirds)
 
-# ─────────────────────────────────────────
-# 予想
-# ─────────────────────────────────────────
-def pick_predictions(info: Dict) -> Dict[str, List[Tuple[int,int,int]]]:
-    rank = info.get("tenji_rank", [])
-    base1 = rank[0] if len(rank)>=1 else 1
-    base2 = rank[1] if len(rank)>=2 else 2
-    base3 = rank[2] if len(rank)>=3 else 3
+    # 押さえ：2頭目に fav を外して、fav を2着固定も混ぜる
+    sub1 = expand_groups(seconds, {fav}, thirds - seconds)
+    sub2 = expand_groups({fav}, {top[3]}, thirds)  # 3番手を2着へ
+    osa = unique_triples(sub1 + sub2)
 
-    main = dedup_trio([
-        (base1, base2, x) for x in [3,4,5,6] if x not in {base1,base2}
-    ] + [
-        (base1, base3, x) for x in [2,4,5,6] if x not in {base1,base3}
-    ])
-    osa = dedup_trio([
-        (base2, base1, x) for x in [3,4,5,6] if x not in {base1,base2}
-    ] + [
-        (base3, base1, x) for x in [2,4,5,6] if x not in {base1,base3}
-    ])
-    ana = dedup_trio([
-        (4,1,x) for x in [2,3,5,6] if x not in {1,4}
-    ] + [
-        (5,1,x) for x in [2,3,4,6] if x not in {1,5}
-    ] + [
-        (6,1,x) for x in [2,3,4,5] if x not in {1,6}
-    ])
+    # 穴：4-5軸/センター軸を持った塊
+    hole_first = set(top[3:5])  # 4番手,5番手
+    hole_sec   = set(top[:3])   # 上位を2着に
+    hole_third = set(range(1,7)) - hole_first
+    ana = expand_groups(hole_first, hole_sec, hole_third)
 
-    return {"main": main[:12], "osa": osa[:12], "ana": ana[:12]}
+    # 圧縮文字列へ
+    main_lines = compress_triples(fav, main)
+    osa_lines  = sorted(set(sum((compress_triples(x, osa) for x in hole_sec|{fav}), [])), key=lambda s:s)
+    ana_lines  = sorted(set(sum((compress_triples(x, ana) for x in hole_first), [])), key=lambda s:s)
 
-def format_prediction_block(pred: Dict) -> str:
-    blocks = []
-    for title in ("main","osa","ana"):
-        trios = pred.get(title, [])
-        if not trios: continue
-        label = {"main":"本線","osa":"押え","ana":"穴目"}[title]
-        line_sets = compress_trios_to_sets(trios)
-        head = f"{label}（{len(trios)}点）"
-        blocks.append("\n".join([head] + line_sets))
-    return "\n\n".join(blocks)
+    return main_lines, osa_lines, ana_lines
 
-# ─────────────────────────────────────────
-# 叙述
-# ─────────────────────────────────────────
-def build_narrative(place: str, rno: int, info: Dict) -> str:
-    if USE_GPT and _OPENAI_OK and os.getenv("OPENAI_API_KEY"):
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        sys = (f"あなたは競艇の予想コメントを書く解説者。言語は{NARRATIVE_LANG}。"
-               "180〜260文字で、具体的根拠（展示上位、進入は内有利前提など）を簡潔に。"
-               "同じ語尾の連続を避け、買い目の狙い所を最後にまとめる。")
-        user = {
-            "place":place, "race":rno,
-            "tenji_rank": info.get("tenji_rank", []),
-            "policy": "展示上位厚め。1本線、2差し・3まくり差しケア、外は展開待ち。"
-        }
-        try:
-            res = client.chat.completions.create(
-                model=GPT_MODEL,
-                temperature=GPT_TEMP,
-                messages=[{"role":"system","content":sys},
-                          {"role":"user","content":f"データ: {user}"}],
-                max_tokens=360,
-            )
-            return res.choices[0].message.content.strip()
-        except Exception as e:
-            print("[gpt] error:", e)
+# -------------------------
+# 文章生成（GPT 任意）
+# -------------------------
+def build_plain_narrative(place, rno, info, scores) -> str:
+    def f(x): return f"{x:.02f}" if x is not None else "-"
+    b = info["boats"]
+    # 展示/Ｓの簡易表
+    rows = []
+    for i in range(1,7):
+        rows.append(f"{i}: 展示{f(b[i]['exh'])} / ST{f(b[i]['st'])}")
+    table = " / ".join(rows)
 
-    rank = info.get("tenji_rank", [])
-    top = "展示計測未取得のため内基本線。" if not rank else f"展示上位は{','.join(map(str,rank[:3]))}番。"
-    msg = [
-        f"{place}{rno}Rの展望。", top,
-        "1の先マイ本線。2は差しで内差詰、3はまくり差しの形で怖い。",
-        "外は4→5→6の序列。スタ展次第で一撃は4-1型まで。"
-    ]
-    return " ".join(msg)
+    tops = sorted(scores.items(), key=lambda x:x[1], reverse=True)
+    lead = f"【{place} {rno}Rの展望】イン優勢寄り。"
+    if tops[0][0] != 1:
+        lead = f"【{place} {rno}Rの展望】枠なりでも{tops[0][0]}号艇が機力上位で主役。"
+    txt = (
+        f"{lead} 展示やST傾向から総合力をスコア化。"
+        f" 上位は {', '.join(str(k) for k,_ in tops[:3])} 。"
+        f" 直前指標: {table}"
+    )
+    return txt
 
-# ─────────────────────────────────────────
-# LINE Webhook（v3は WebhookParser を使う）
-# ─────────────────────────────────────────
-@app.post("/callback")
+def build_gpt_narrative(place, rno, info, scores) -> str:
+    if not (USE_GPT and OPENAI_API_KEY):
+        return build_plain_narrative(place, rno, info, scores)
+
+    b = info["boats"]
+    def val(x): return "-" if x is None else f"{x:.02f}"
+
+    context = []
+    for i in range(1,7):
+        context.append(
+            f"{i}号艇: 展示タイム={val(b[i]['exh'])}, ST近辺={val(b[i]['st'])}, "
+            f"FLリスク={'有' if b[i]['fl_flag'] else '無'}"
+        )
+    tops = sorted(scores.items(), key=lambda x:x[1], reverse=True)
+
+    sys = (
+        "あなたはボートレースの予想コメントを作るアナリストです。"
+        "専門用語は使いすぎず、要点を3〜6文で、読みやすい日本語で。"
+        "『固い/波乱/センターの仕掛け/まくり差し警戒』などの表現は自然に。"
+    )
+    usr = (
+        f"レース: {place} {rno}R\n"
+        f"指標:\n" + "\n".join(context) + "\n\n"
+        f"スコア上位: " + ", ".join(f"{k}:{round(v,1)}" for k,v in tops[:6]) + "\n"
+        "これを踏まえて、簡潔だが少し踏み込んだ展開予想文を書いて。"
+    )
+
+    try:
+        res = openai.ChatCompletion.create(
+            model=GPT_MODEL,
+            temperature=GPT_TEMP,
+            messages=[
+                {"role":"system","content":sys},
+                {"role":"user","content":usr}
+            ]
+        )
+        return res.choices[0].message.content.strip()
+    except Exception as e:
+        # 失敗時はプレーン文
+        return build_plain_narrative(place, rno, info, scores)
+
+# -------------------------
+# 返信メッセージ整形
+# -------------------------
+def build_reply(place, jcd, rno, ymd) -> str:
+    info = scrape_beforeinfo(jcd, rno, ymd)
+    scores = score_boats(info)
+
+    main, osa, ana = make_ticket_sets(scores)
+    url = info["url"]
+
+    nar = build_gpt_narrative(place, rno, info, scores)
+
+    def section(title, lines):
+        if not lines:
+            return ""
+        return f"\n{title}\n" + "\n".join(lines)
+
+    text = (
+        "――――――――――――――\n"
+        f"{nar}\n"
+        f"(参考: {url})\n"
+        f"{section('本線', main)}"
+        f"{section('押え', osa)}"
+        f"{section('穴目', ana)}"
+    ).strip()
+
+    return text
+
+# -------------------------
+# LINE Webhook
+# -------------------------
+@app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+
     try:
         events = parser.parse(body, signature)
-    except InvalidSignatureError:
-        return "invalid signature", 400
-    except Exception as e:
-        print("[parse] error:", e); return "error", 400
+    except Exception:
+        abort(400)
 
-    for event in events:
-        if isinstance(event, MessageEvent) and isinstance(event.message, TextMessageContent):
-            handle_text_message(event)
+    for ev in events:
+        # Text only
+        if ev.type == "message" and getattr(ev.message, "type", "") == "text":
+            text = ev.message.text
+            try:
+                place, jcd, rno, ymd = parse_user_text(text)
+                reply = build_reply(place, jcd, rno, ymd)
+            except Exception as e:
+                reply = (
+                    "入力例:『常滑 8 20250812』/『浜名湖 10』\n"
+                    f"error: {e}"
+                )
+
+            line_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=ev.reply_token,
+                    messages=[TextMessage(text=reply)]
+                )
+            )
+
     return "OK"
 
-def handle_text_message(event: MessageEvent):
-    text = event.message.text.strip()
-    parsed = parse_user_text(text)
-    if not parsed:
-        reply(event.reply_token,
-              "例）「常滑 6 20250812」/「丸亀 9」\n展開だけなら「1-4-235」「45-1=235」「4-12-3」。")
-        return
-
-    if parsed["mode"]=="shorthand":
-        trios = expand_shorthand(parsed["expr"])
-        if not trios:
-            reply(event.reply_token, "展開できませんでした。例）1-4-235 / 45-1=235 / 4-12-3")
-            return
-        line_sets = compress_trios_to_sets(trios)
-        out = f"展開（{len(trios)}点）\n" + "\n".join(line_sets)
-        reply(event.reply_token, out)
-        return
-
-    place, jcd, rno, hd = parsed["place"], parsed["jcd"], parsed["rno"], parsed["hd"]
-    try:
-        info = fetch_beforeinfo(jcd, rno, hd)
-    except Exception as e:
-        print("[beforeinfo] fetch error:", e)
-        url = beforeinfo_url(jcd, rno, hd)
-        reply(event.reply_token, f"📍 {place}{rno}R（{hd}）\n直前情報の取得に失敗。少し待って再試行を。\n（参考: {url}）")
-        return
-
-    preds = pick_predictions(info)
-    url = info.get("url", beforeinfo_url(jcd, rno, hd))
-    nar = build_narrative(place, rno, info)
-    header = "――――――――――――――――\n"
-    head2 = f"{nar}\n（参考: {url}）\n"
-    block = format_prediction_block(preds)
-    reply(event.reply_token, f"{header}{head2}\n{block}".strip())
-
-def reply(reply_token: str, text: str):
-    try:
-        messaging_api.reply_message(
-            ReplyMessageRequest(reply_token=reply_token, messages=[TextMessage(text=text[:4800])])
-        )
-    except Exception as e:
-        print("[reply] error:", e)
-
-# health
-@app.get("/healthz")
-def healthz(): return jsonify(ok=True)
-
-@app.get("/")
-def root(): return "bot alive"
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT","10000")))
+# ヘルスチェック
+@app.route("/")
+def index():
+    return "ok"
