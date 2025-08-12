@@ -1,23 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-teikoku_db_predictor.py
-- 艇国データバンク(boatrace-db.net)のレース個別ページ1件から出走情報を抽出
-- サイト規約に合わせてアクセスは3秒以上の間隔を強制
-- ページ構造変化に耐えるため、表/カード/自由テキストの3段抽出でロバスト化
-- 簡易ロジックで「イン逃げ / まくり(3) / まくり(4) / 差し」を判定
-- 本線/抑え/穴 を各6〜8点に整形して返す（毎回同じ目の固定化を回避するシード付き）
-- 依存: requests, bs4
+teikoku_db_predictor.py (v2)
+- データ源: 艇国データバンクのレース個別ページ（/race/数字）
+- 規約配慮: 1回のみ取得・3秒以上のアクセス間隔
+- パーサ: テーブル優先＋自由テキスト走査で 1~6号艇の {lane,name,shibu,motor_two_rate,tenji_time} を推定
+- 予想: イン/まくり/差しの簡易展開＋重み付け（イン有利ベース, モーター2連率, 展示タイム）
+- 出力: 本線/抑え/穴 を各6〜8点に整形（毎回同じ目を避ける軽いシード）
+
+依存: requests, beautifulsoup4
 """
 import re
 import time
 import requests
-from hashlib import md5
 from typing import List, Dict, Any, Optional
+from hashlib import md5
 from bs4 import BeautifulSoup
 
-# --- 規約順守: 3秒以上のアクセス間隔 ---
+# ---- 規約順守 (3秒以上) ----
 _LAST_FETCH_TS = 0.0
-_MIN_INTERVAL_SEC = 3.1  # 3秒よりわずかに大きくして安全側
+_MIN_INTERVAL_SEC = 3.1
 
 def _wait_interval():
     global _LAST_FETCH_TS
@@ -27,21 +28,22 @@ def _wait_interval():
         time.sleep(_MIN_INTERVAL_SEC - dt)
     _LAST_FETCH_TS = time.time()
 
-# --- HTML抽出のユーティリティ ---
-def _clean_text(s: str) -> str:
+# ---- Utils ----
+def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 def _safe_text(el) -> str:
-    return _clean_text(el.get_text(" ")) if el else ""
+    return _clean(el.get_text(" ")) if el else ""
 
+def _float_or_none(s: str) -> Optional[float]:
+    try:
+        return float(s)
+    except:
+        return None
+
+# ---- 抽出 ----
 def _extract_rows(soup: BeautifulSoup) -> List[List[str]]:
-    """
-    壊れにくさ優先の多段抽出:
-      1) table > tr > (th|td)
-      2) リスト/カード断片から 2..12語を一行として抽出
-    """
     rows: List[List[str]] = []
-    # 1) テーブル優先
     for tbl in soup.select("table"):
         for tr in tbl.select("tr"):
             cols = [_safe_text(td) for td in tr.select("th,td")]
@@ -50,99 +52,123 @@ def _extract_rows(soup: BeautifulSoup) -> List[List[str]]:
                 rows.append(cols)
     if rows:
         return rows
-
-    # 2) カード/リストの断片から拾う（保険）
-    generic_rows: List[List[str]] = []
+    # 保険（カード/リスト断片）
+    backup: List[List[str]] = []
     for blk in soup.select("section,article,div,li"):
-        txts = [t.strip() for t in _safe_text(blk).split(" ") if t.strip()]
-        if 2 <= len(txts) <= 12:
-            generic_rows.append(txts)
-    return generic_rows
+        t = _safe_text(blk)
+        ts = [x for x in re.split(r"[ \n\t]+", t) if x]
+        if 2 <= len(ts) <= 16:
+            backup.append(ts)
+    return backup
+
+LANE_RX = re.compile(r"^([1-6])\s*号?艇?$")
+PCT_RX  = re.compile(r"(\d{1,2}(?:\.\d)?)\s*%")
+TENJI_RX = re.compile(r"(?:展示|直前|TMP|T[^\w]?)\s*[:：]?\s*([0-2]?\d\.\d)")
 
 def _guess_players(rows: List[List[str]]) -> List[Dict[str, Any]]:
-    """
-    1〜6号艇の {lane,name,shibu,motor_two_rate} を推定抽出。
-    - 「%」を含む数値は2連率候補として取得（例: 36.5%）
-    - 号艇候補は 1..6 の数字
-    - 選手名は漢字/カナを多く含む語を優先
-    """
-    players: List[Dict[str, Any]] = []
+    """1~6号艇の選手情報を推定抽出"""
+    players: Dict[int, Dict[str, Any]] = {}
 
+    # 1) 行単位でざっくり拾う
     for row in rows:
         joined = " ".join(row)
-        tokens = re.split(r"[ \t,／/|│・\[\]（）()\u3000>:\-]+", joined)
-
+        tokens = [t for t in re.split(r"[ /｜|│・\[\]（）(),:：\u3000]+", joined) if t]
+        lane = None
         # lane
-        lane: Optional[int] = None
         for t in tokens:
+            m = LANE_RX.match(t)
+            if m:
+                lane = int(m.group(1))
+                break
             if t.isdigit() and 1 <= int(t) <= 6:
                 lane = int(t); break
+        if not lane:
+            continue
 
-        # name
-        name: Optional[str] = None
+        d = players.get(lane, {"lane": lane, "name": None, "shibu": None,
+                               "motor_two_rate": None, "tenji_time": None})
+
+        # name候補（漢字/カナ優先）
         name_cands = [t for t in tokens if 2 <= len(t) <= 10 and re.search(r"[ぁ-んァ-ン一-龥]", t)]
-        if name_cands:
-            name = name_cands[0]
+        if not d["name"] and name_cands:
+            d["name"] = name_cands[0]
 
-        # shibu（2-3文字を優先）
-        shibu: Optional[str] = None
-        for t in tokens:
-            if 2 <= len(t) <= 3 and re.search(r"[一-龥ァ-ヶ]", t):
-                shibu = t; break
+        # 支部っぽい 2-3文字
+        if not d["shibu"]:
+            for t in tokens:
+                if 2 <= len(t) <= 3 and re.search(r"[一-龥ァ-ヶ]", t):
+                    d["shibu"] = t; break
 
-        # motor two-rate
-        rate: Optional[float] = None
-        m = re.search(r"(\d{1,2}(?:\.\d)?)\s*%", joined)
-        if m:
-            try:
-                rate = float(m.group(1))
-            except:
-                rate = None
+        # motor two rate
+        if d["motor_two_rate"] is None:
+            m = PCT_RX.search(joined)
+            if m:
+                d["motor_two_rate"] = _float_or_none(m.group(1))
 
-        if lane and name:
-            players.append({
-                "lane": lane,
-                "name": name,
-                "shibu": shibu,
-                "motor_two_rate": rate
-            })
+        # 展示タイム
+        if d["tenji_time"] is None:
+            m2 = TENJI_RX.search(joined)
+            if m2:
+                d["tenji_time"] = _float_or_none(m2.group(1))
 
-        if len(players) >= 6:
-            break
+        players[lane] = d
 
-    # 欠けをダミーで埋める
-    exist = {p["lane"] for p in players}
-    for l in range(1, 7):
-        if l not in exist:
-            players.append({
-                "lane": l, "name": f"不明{l}", "shibu": None, "motor_two_rate": None
-            })
+    # 2) 欠け埋め
+    out: List[Dict[str, Any]] = []
+    for l in range(1,7):
+        if l in players:
+            out.append(players[l])
+        else:
+            out.append({"lane": l, "name": f"不明{l}", "shibu": None,
+                        "motor_two_rate": None, "tenji_time": None})
+    return out
 
-    players.sort(key=lambda x: x["lane"])
-    return players
+# ---- 予想ロジック ----
+def _lane_base_scores() -> Dict[int, float]:
+    """
+    イン有利の一般的傾向を素点化（平均的な場を想定）。
+    必要なら後で場別補正を足す（今はページから場名が取りにくいので一定値）。
+    """
+    # 1~6の基礎点（相対）。合計は任意でOK
+    return {1: 62.0, 2: 20.0, 3: 10.5, 4: 5.5, 5: 1.5, 6: 0.5}
 
-# --- 展開推定と買い目生成 ---
+def _score_players(players: List[Dict[str, Any]]) -> Dict[int, float]:
+    base = _lane_base_scores()
+    scores: Dict[int, float] = {i: base[i] for i in range(1,7)}
+
+    # モーター2連率補正（±10%幅）
+    for p in players:
+        r = p.get("motor_two_rate")
+        if r is not None:
+            # 50% を中立、10%で ±3pt 程度の補正
+            scores[p["lane"]] += (r - 50.0) * 0.3
+
+    # 展示タイム補正（速い=加点 / 遅い=減点）
+    tenjis = [p["tenji_time"] for p in players if p.get("tenji_time") is not None]
+    if len(tenjis) >= 2:
+        best = min(tenjis)
+        worst = max(tenjis)
+        span = max(0.01, worst - best)
+        for p in players:
+            t = p.get("tenji_time")
+            if t is not None:
+                # 速いほど +4pt まで
+                scores[p["lane"]] += (worst - t) / span * 4.0
+
+    return scores
+
 def _decide_scenario(players: List[Dict[str, Any]], seed: str) -> str:
-    """
-    イン逃げ / まくり(3) / まくり(4) / 差し を簡易判定。
-    ・1=イン強ければ「イン逃げ」
-    ・3/4の率が強ければ各「まくり」
-    ・拮抗時はURL等から作るシードで揺らぎ→毎回同じ目を回避
-    """
-    def rate(lane, default=52.0):
-        p = next((x for x in players if x["lane"] == lane), None)
-        return (p.get("motor_two_rate") or default) if p else default
-
-    r1 = rate(1, 55.0)
-    r3 = rate(3, 50.0) + 2.0
-    r4 = rate(4, 50.0) + 3.0
-
+    """イン逃げ/まくり(3)/まくり(4)/差し の大枠選択"""
+    sc = _score_players(players)
     s = int(md5(seed.encode("utf-8")).hexdigest(), 16) % 100
-    if r1 >= max(r3, r4) + 3:
+
+    # キー比較
+    r1, r3, r4 = sc[1], sc[3], sc[4]
+    if r1 >= max(r3, r4) + 4.0:
         return "イン逃げ"
-    if r4 >= max(r1, r3) + 2:
+    if r4 >= max(r1, r3) + 2.0:
         return "まくり(4)"
-    if r3 >= max(r1, r4) + 2:
+    if r3 >= max(r1, r4) + 2.0:
         return "まくり(3)"
     return "差し" if s < 40 else ("イン逃げ" if s < 70 else "まくり(4)")
 
@@ -153,61 +179,55 @@ def _uniq(seq: List[str]) -> List[str]:
             out.append(x); seen.add(x)
     return out
 
-def _tickets_for(base: str) -> Dict[str, List[str]]:
+def _tickets_for(base: str, scores: Dict[int, float]) -> Dict[str, List[str]]:
     """
-    ベース展開 → 買い目(各6〜8点)
+    展開→買い目（各6〜8点）。中穴寄りを少し入れる。
     """
     if base == "イン逃げ":
         hon = [f"1-{a}-{b}" for a in [2,3] for b in [2,3,4,5,6] if a != b]
         osa = [f"1-{a}-{b}" for a in [4,5] for b in [2,3,4,5,6] if a != b][:6]
-        ana = ["2-1-3","2-1-4","3-1-2","3-1-4","1-6-2","1-2-6"]
+        # 穴は外の伸び・スコア高めを少量
+        outs = [i for i,_ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True) if i>=4][:2]
+        ana = [f"{a}-1-{b}" for a in [2,3] for b in outs][:6]
+        if len(ana) < 6:
+            ana += ["2-1-3","3-1-2"][:6-len(ana)]
     elif base == "まくり(3)":
-        hon = ["3-1-2","3-1-4","3-4-1","3-2-1","3-5-1","3-1-5"]
-        osa = ["1-3-2","1-3-4","3-2-4","3-4-2","2-3-1","4-3-1"]
-        ana = ["4-5-3","5-3-1","2-3-5","3-6-1","2-1-3","1-2-3"]
+        hon = ["3-1-2","3-1-4","3-4-1","3-2-1","3-5-1","3-1-5","3-1-6"][:8]
+        osa = ["1-3-2","1-3-4","3-2-4","3-4-2","2-3-1","4-3-1"][:6]
+        ana = ["4-5-3","5-3-1","2-3-5","3-6-1","2-1-3","1-2-3"][:6]
     elif base == "まくり(4)":
-        hon = ["4-1-2","4-1-3","4-5-1","4-2-1","4-3-1","4-1-5"]
-        osa = ["1-4-2","1-4-3","4-2-3","4-3-2","2-4-1","5-4-1"]
-        ana = ["5-4-2","6-4-1","2-1-4","3-1-4","4-6-1","2-4-6"]
-    else:  # 差し
-        hon = ["2-1-3","2-1-4","1-2-3","1-2-4","2-3-1","2-4-1","1-3-2","1-4-2"]
-        osa = ["3-2-1","4-2-1","2-1-5","1-2-5","2-1-6","1-2-6"]
-        ana = ["3-1-2","4-1-2","2-5-1","5-2-1","6-2-1","2-6-1"]
+        hon = ["4-1-2","4-1-3","4-5-1","4-2-1","4-3-1","4-1-5","4-1-6"][:8]
+        osa = ["1-4-2","1-4-3","4-2-3","4-3-2","2-4-1","5-4-1"][:6]
+        ana = ["5-4-2","6-4-1","2-1-4","3-1-4","4-6-1","2-4-6"][:6]
+    else:  # 差し（2中心）
+        hon = ["2-1-3","2-1-4","1-2-3","1-2-4","2-3-1","2-4-1","1-3-2","1-4-2"][:8]
+        osa = ["3-2-1","4-2-1","2-1-5","1-2-5","2-1-6","1-2-6"][:6]
+        ana = ["3-1-2","4-1-2","2-5-1","5-2-1","6-2-1","2-6-1"][:6]
 
-    return {
-        "本線": _uniq(hon)[:8],
-        "抑え": _uniq(osa)[:6],
-        "穴":   _uniq(ana)[:6]
-    }
+    return {"本線": _uniq(hon)[:8], "抑え": _uniq(osa)[:6], "穴": _uniq(ana)[:6]}
 
-# --- 公開API ---
+# ---- 公開API ----
 def predict_from_teikoku(url: str) -> Dict[str, Any]:
     """
     Parameters
     ----------
-    url : str
-        艇国データバンクのレース個別ページURL（ユーザーがブラウザで開けるページ）
+    url: str  # 例: https://boatrace-db.net/race/1234567
+
     Returns
     -------
-    dict (メッセージ化しやすい形)
     {
       "source": url,
-      "players": [
-         {"lane":1,"name":"○○","shibu":"福岡","motor_two_rate": 36.5}, ...
-      ],
+      "players": [{"lane":1,"name":"..","shibu":"..","motor_two_rate":36.5,"tenji_time":6.69}, ...],
       "scenario": "イン逃げ",
-      "tickets": {"本線":[...6-8点], "抑え":[...], "穴":[...] }
+      "scores": {1:..,2:.., ...},
+      "tickets": {"本線":[...], "抑え":[...], "穴":[...]}
     }
     """
-    if not url.startswith("http"):
-        raise ValueError("URLを確認してください（http から始まるフルURLが必要です）。")
+    if not re.match(r"^https?://(?:www\.)?boatrace-db\.net/race/\d+/?$", url, re.I):
+        raise ValueError("対応形式は https://boatrace-db.net/race/数字 です。")
 
-    _wait_interval()  # 3秒以上の間隔
-
-    # 1回だけ取得（同一URLに繰り返しアクセスしない）
-    headers = {
-        "User-Agent": "yosou-bot/1.0 (+respecting-site-rules)"
-    }
+    _wait_interval()
+    headers = {"User-Agent": "yosou-bot/1.0 (+respecting-site-rules)"}
     r = requests.get(url, headers=headers, timeout=15)
     r.raise_for_status()
     r.encoding = r.apparent_encoding
@@ -215,47 +235,34 @@ def predict_from_teikoku(url: str) -> Dict[str, Any]:
 
     rows = _extract_rows(soup)
     players = _guess_players(rows)
-
-    # 展開決定（URLでシード固定：同じURLは同じ揺らぎ）
+    scores = _score_players(players)
     scenario = _decide_scenario(players, seed=url)
+    tickets = _tickets_for(scenario, scores)
 
-    tickets = _tickets_for(scenario)
     return {
         "source": url,
         "players": players,
         "scenario": scenario,
+        "scores": scores,
         "tickets": tickets
     }
 
-# --- フォーマッタ（LINE返信用の体裁） ---
 def format_prediction_message(result: Dict[str, Any]) -> str:
     lines = []
     lines.append("【艇国DB 予想】")
     lines.append(f"展開見立て：{result['scenario']}")
     lines.append("")
-    def fmt_block(ttl, arr):
-        rows = " / ".join(arr)
-        return f"《{ttl}》\n{rows}"
-    lines.append(fmt_block("本線", result["tickets"]["本線"]))
-    lines.append(fmt_block("抑え", result["tickets"]["抑え"]))
-    lines.append(fmt_block("穴",   result["tickets"]["穴"]))
+    def blk(ttl, arr): return f"《{ttl}》\n" + " / ".join(arr)
+    lines.append(blk("本線", result["tickets"]["本線"]))
+    lines.append(blk("抑え", result["tickets"]["抑え"]))
+    lines.append(blk("穴",   result["tickets"]["穴"]))
     lines.append("")
-    # 選手一覧（簡易）
-    plist = []
+    lines.append("出走想定：")
     for p in result["players"]:
-        rate = f"{p['motor_two_rate']}%" if p['motor_two_rate'] is not None else "-"
-        shibu = p['shibu'] or "-"
-        plist.append(f"{p['lane']}号艇 {p['name']}（{shibu} / M2連 {rate}）")
-    lines.append("出走想定：\n" + "\n".join(plist))
+        rate = f"{p['motor_two_rate']}%" if p.get("motor_two_rate") is not None else "-"
+        tenj = f"{p['tenji_time']}" if p.get("tenji_time") is not None else "-"
+        shibu = p.get("shibu") or "-"
+        lines.append(f"{p['lane']}号艇 {p['name']}（{shibu} / M2連:{rate} / 展示:{tenj}）")
     lines.append("")
-    lines.append("※データ取得: 艇国データバンク（サイト規約順守 / 3秒間隔・過剰アクセスなし）")
+    lines.append("※データ取得: 艇国データバンク（1アクセス/回・3秒インターバル遵守）")
     return "\n".join(lines)
-
-if __name__ == "__main__":
-    # 手動テスト用（例のURLを入れて実行）
-    TEST_URL = "https://boatrace-db.net/race/..."  # ←レースページURLに差し替え
-    try:
-        res = predict_from_teikoku(TEST_URL)
-        print(format_prediction_message(res))
-    except Exception as e:
-        print("実行エラー:", e)
