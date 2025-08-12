@@ -1,21 +1,12 @@
-# --- Web ---
-Flask==3.0.3
+Flask==3.0.2
 gunicorn==21.2.0
 
-# --- LINE SDK（aiohttp を使う版）---
+# LINE
 line-bot-sdk==3.11.0
-aiohttp==3.10.10
+# Python 3.11 で安定するレンジ（3.12未満）
+aiohttp>=3.9.5,<3.12
 
-# --- スクレイピング系 ---
+# スクレイピング
 requests==2.31.0
 beautifulsoup4==4.12.3
 lxml==5.2.2
-html5lib==1.1
-
-# --- （使っていれば）OpenAI ---
-openai==0.28.1
-
-# --- （使っていれば）Google Vision OCR ---
-google-cloud-vision==3.7.2
-google-auth==2.33.0
-google-auth-httplib2==0.2.0
