@@ -1,378 +1,370 @@
-# app.py  ←この名前で保存
-# -*- coding: utf-8 -*-
 import os
 import re
+import json
 import math
-import datetime as dt
-from typing import List, Optional
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional
 
-import requests
+import httpx
 from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, abort, jsonify
 
-# ===== LINE Bot =====
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-app = Flask(__name__)
+# -----------------------------
+# 基本設定
+# -----------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("yosou-bot")
 
-# ===== 環境変数 =====
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+
+if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
+    logger.warning("LINE 環境変数が未設定です。LINE 連携は動かないかもしれません。")
+
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
 handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
 
-# ===== 場コード（日和/公式 共通 01..24）=====
-PLACE_MAP = {
-    "桐生":1,"戸田":2,"江戸川":3,"平和島":4,"多摩川":5,"浜名湖":6,"蒲郡":7,"常滑":8,"津":9,"三国":10,
-    "びわこ":11,"住之江":12,"尼崎":13,"鳴門":14,"丸亀":15,"児島":16,"宮島":17,"徳山":18,"下関":19,"若松":20,
-    "芦屋":21,"福岡":22,"唐津":23,"大村":24
-}
-INV_PLACE = {v:k for k,v in PLACE_MAP.items()}
+app = Flask(__name__)
 
-# ===== 買い目の最大点数 =====
-MAX_MAIN   = 12   # 本線
-MAX_COVER  = 8    # 抑え
-MAX_ATTACK = 8    # 狙い
-
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-HDRS = {
-    "User-Agent": UA,
-    "Referer": "https://kyoteibiyori.com/",
-    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
+# 競艇場 -> place_no
+PLACE_NO = {
+    "桐生": 1, "戸田": 2, "江戸川": 3, "平和島": 4, "多摩川": 5, "浜名湖": 6,
+    "蒲郡": 7, "常滑": 8, "津": 9, "三国": 10, "琵琶湖": 11, "住之江": 12,
+    "尼崎": 13, "鳴門": 14, "丸亀": 15, "児島": 16, "宮島": 17, "徳山": 18,
+    "下関": 19, "若松": 20, "芦屋": 21, "福岡": 22, "唐津": 23, "大村": 24,
 }
 
-def today_ymd():
-    return (dt.datetime.utcnow() + dt.timedelta(hours=9)).strftime("%Y%m%d")
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+)
 
-def fmt_ymd(ymd: str) -> str:
-    try:
-        return dt.datetime.strptime(ymd, "%Y%m%d").strftime("%Y/%m/%d")
-    except Exception:
-        return ymd
+# -----------------------------
+# HTML 取得＆パース（日和）
+# -----------------------------
+BIYORI_URL = "https://kyoteibiyori.com/race_shusso.php"
 
-def parse_user_text(text: str):
-    """
-    例:
-      丸亀 8
-      丸亀 8R
-      丸亀 8 20250811
-    -> (place_no, race_no, ymd) or (None, None, None)
-    """
-    t = text.strip()
-    if t.lower() in ("help","使い方","?","？"):
-        return ("HELP", None, None)
-
-    m = re.match(r"^\s*([^\s0-9]+)\s*([0-9]{1,2})[Rr]?\s*(\d{8})?\s*$", t)
-    if not m:
-        return (None, None, None)
-    name = m.group(1)
-    rno  = int(m.group(2))
-    ymd  = m.group(3) or today_ymd()
-    place_no = PLACE_MAP.get(name)
-    if not place_no:
-        return (None, None, None)
-    return (place_no, rno, ymd)
-
-# ========== 日和スクレイプ（直前 slider=4 / MyData slider=9） ==========
-def biyori_url(place_no: int, race_no: int, ymd: str, slider: int, pc: bool=False):
-    base = "https://kyoteibiyori.com/pc/race_shusso.php" if pc else "https://kyoteibiyori.com/race_shusso.php"
-    return f"{base}?place_no={place_no}&race_no={race_no}&hiduke={ymd}&slider={slider}"
-
-def _clean(s: str) -> str:
-    return re.sub(r"\s+", "", s or "")
-
-def _row_values(tbl, row_label: str, expected_cols=6):
-    for tr in tbl.find_all("tr"):
-        cells = [c.get_text(strip=True) for c in tr.find_all(["th","td"])]
-        if not cells: continue
-        if _clean(cells[0]).startswith(_clean(row_label)):
-            vals = cells[1:1+expected_cols]
-            while len(vals) < expected_cols: vals.append(None)
-            return vals
-    return [None]*expected_cols
-
-class TableNotFound(Exception): ...
-
-def fetch_biyori_once(place_no: int, race_no: int, ymd: str, slider: int):
-    """
-    1回ぶん（日和 PC優先→SP）を試し、テーブルを辞書で返す。
-    slider=4 -> {tenji, shuukai, mawariashi, chokusen}
-    slider=9 -> {avg_st, st_rank}
-    """
-    for pc in (True, False):
-        url = biyori_url(place_no, race_no, ymd, slider, pc=pc)
-        r = requests.get(url, headers=HDRS, timeout=15)
+def fetch_biyori(place_no: int, race_no: int, hiduke: str, slider: int = 4) -> str:
+    """ページHTMLを取得"""
+    params = {"place_no": place_no, "race_no": race_no, "hiduke": hiduke, "slider": slider}
+    headers = {"User-Agent": USER_AGENT, "Referer": "https://kyoteibiyori.com/"}
+    timeout = httpx.Timeout(20.0, connect=10.0)
+    with httpx.Client(timeout=timeout, headers=headers, follow_redirects=True) as client:
+        r = client.get(BIYORI_URL, params=params)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
-        # キー語を含む“大きい”テーブルを探す
-        keys = ["展示","周回","周り足","直線"] if slider==4 else ["平均ST","ST順位","平均ＳＴ"]
-        target = None
-        for t in soup.find_all("table"):
-            txt = _clean(t.get_text(" ", strip=True))
-            if all(k in txt for k in keys):
-                target = t
-                break
-        if target:
-            out = {"source":"biyori","url":url,"slider":slider}
-            if slider==4:
-                out["tenji"]      = _row_values(target, "展示")
-                out["shuukai"]    = _row_values(target, "周回")
-                out["mawariashi"] = _row_values(target, "周り足")
-                out["chokusen"]   = _row_values(target, "直線")
-            else:
-                out["avg_st"]  = _row_values(target, "平均ST")
-                out["st_rank"] = _row_values(target, "ST順位")
-            return out
-    raise TableNotFound(f"[biyori] table not found: slider={slider}")
+        return r.text
 
-def fetch_biyori_with_fallback(place_no: int, race_no: int, ymd: str):
+def parse_biyori_metrics(html: str) -> Dict[int, Dict[str, Optional[float]]]:
     """
-    直前(4)→MyData(9) の順で集め、どちらもNGなら公式へフォールバック。
-    戻り値:
-      {"fallback": False, "tenji":[...],...,"src":"biyori","ref_url": "..."}
-      or
-      {"fallback": True, "src":"official","ref_url": "..."}
+    直前情報のテーブルから 指数を抜く。
+    返り値: {lane: {"展示":sec, "周回":sec, "周り足":pt, "直線":pt, "ST":sec}}
     """
-    collected = {}
-    errs = []
-    for s in (4, 9):
-        try:
-            d = fetch_biyori_once(place_no, race_no, ymd, s)
-            collected.update(d)
-        except Exception as e:
-            errs.append(str(e))
-    if collected.get("tenji") or collected.get("avg_st"):
-        collected["fallback"] = False
-        collected["src"] = "biyori"
-        collected["ref_url"] = collected.get("url","")
-        collected["errors"] = errs
-        return collected
+    soup = BeautifulSoup(html, "lxml")
 
-    # 公式フォールバック（URLだけ返す簡易）
-    url = official_beforeinfo_url(place_no, race_no, ymd)
-    return {"fallback": True, "src":"official", "ref_url": url, "errors": errs}
+    # テーブル総当たりで、行頭が「展示/周回/周り足/直線/ST」のブロックを探す
+    wanted = ["展示", "周回", "周り足", "直線", "ST"]
+    metrics: Dict[str, List[Optional[float]]] = {k: [None]*6 for k in wanted}
 
-# ========== 公式 beforeinfo ==========
-def official_beforeinfo_url(place_no: int, race_no: int, ymd: str) -> str:
-    jcd = f"{place_no:02d}"
-    return f"https://www.boatrace.jp/owpc/pc/race/beforeinfo?rno={race_no}&jcd={jcd}&hd={ymd}"
+    tables = soup.find_all("table")
+    if not tables:
+        raise ValueError("table-not-found")
 
-# ========== 解析 & 買い目生成 ==========
-def _to_float(x) -> Optional[float]:
-    if x is None: return None
-    try:
-        s = str(x).replace("F","").replace("L","").replace("秒","")
-        m = re.search(r"-?\d+(?:\.\d+)?", s)
-        return float(m.group(0)) if m else None
-    except Exception:
+    found_any = False
+    for tbl in tables:
+        rows = tbl.find_all("tr")
+        for tr in rows:
+            cells = tr.find_all(["th", "td"])
+            if not cells:
+                continue
+            head = cells[0].get_text(strip=True)
+            if head not in wanted:
+                continue
+
+            # 右6列が 1～6号艇
+            vals = []
+            for td in cells[1:7]:
+                t = td.get_text(strip=True)
+                v = _to_float_safe(t)
+                vals.append(v)
+
+            # 足りない列は詰める
+            while len(vals) < 6:
+                vals.append(None)
+
+            metrics[head] = vals[:6]
+            found_any = True
+
+    if not found_any:
+        raise ValueError("table-not-found")
+
+    # lane dict に寄せ替え
+    lane_metrics: Dict[int, Dict[str, Optional[float]]] = {}
+    for lane in range(1, 7):
+        lane_metrics[lane] = {k: metrics[k][lane-1] for k in wanted}
+
+    return lane_metrics
+
+def _to_float_safe(s: str) -> Optional[float]:
+    """ '6.76', 'F.05', 'F05', '-' などを float に寄せる """
+    if not s or s == "-" or s is None:
         return None
+    s = s.replace("F.", ".").replace("F", "")
+    try:
+        return float(s)
+    except Exception:
+        # 直線/周り足 で 7.88 などのフォーマットはそのまま
+        # 万一全角が混じる場合も置換
+        try:
+            return float(s.replace("．", "."))
+        except Exception:
+            return None
 
-def _rank(vals: List[Optional[float]], higher_is_better: bool) -> List[int]:
-    pairs = []
-    for i,v in enumerate(vals):
-        if v is None:
-            pairs.append((math.inf if higher_is_better else -math.inf, i))
-        else:
-            pairs.append((v, i))
-    pairs.sort(key=lambda x:x[0], reverse=higher_is_better)
-    ranks = [0]*6
-    for pos,(_,idx) in enumerate(pairs, start=1):
-        ranks[idx]=pos
-    return ranks
-
-def analyze_and_build_bets(data: dict):
+# -----------------------------
+# 予想ロジック（簡易）
+# -----------------------------
+def score_lanes(lane_data: Dict[int, Dict[str, Optional[float]]]) -> Dict[int, float]:
     """
-    日和の直前(展示/周回/周り足/直線)＋MyData(平均ST) を統合して
-    詳細な展開文＋本線/抑え/狙い（多め）を作る
+    展示/周回(小さいほど良)・周り足/直線(大きいほど良)・ST(小さいほど良)を総合スコア化
+    ＋内枠バイアス
     """
-    tenji   = [ _to_float(x) for x in data.get("tenji",      [None]*6) ]
-    shuukai = [ _to_float(x) for x in data.get("shuukai",    [None]*6) ]
-    mawari  = [ _to_float(x) for x in data.get("mawariashi", [None]*6) ]
-    choku   = [ _to_float(x) for x in data.get("chokusen",   [None]*6) ]
-    avg_st  = [ _to_float(x) for x in data.get("avg_st",     [None]*6) ]
-    st_rank = [ _to_float(x) for x in data.get("st_rank",    [None]*6) ]
+    lanes = list(lane_data.keys())
 
-    # ランク化（小さいほど良: 展示/周回/周り足/平均ST, 大きいほど良: 直線）
-    rk_tenji = _rank(tenji,   higher_is_better=False)
-    rk_shu   = _rank(shuukai, higher_is_better=False)
-    rk_mawa  = _rank(mawari,  higher_is_better=False)
-    rk_choku = _rank(choku,   higher_is_better=True)
-    rk_st    = _rank(avg_st,  higher_is_better=False)
+    def rank(values: List[Optional[float]], higher_is_better: bool) -> Dict[int, float]:
+        arr = []
+        for i, v in enumerate(values, start=1):
+            if v is None or math.isnan(v):
+                continue
+            arr.append((i, v))
+        if not arr:
+            return {i: 0.0 for i in lanes}
 
-    # 総合スコア（重み）
-    W = {"展示":0.30, "周回":0.25, "周り足":0.20, "直線":0.15, "ST":0.10}
-    score = [0.0]*6
-    for i in range(6):
-        for rk,key in [(rk_tenji,"展示"),(rk_shu,"周回"),(rk_mawa,"周り足"),(rk_choku,"直線"),(rk_st,"ST")]:
-            if rk[i]==0: continue
-            score[i] += (7 - rk[i]) * W[key]
-    order = sorted(range(6), key=lambda i: score[i], reverse=True)  # indices 0..5
-    lanes = [i+1 for i in order]
+        # ソート方向
+        arr.sort(key=lambda x: x[1], reverse=higher_is_better)
+        # スコア 6,5,4... を割り当て
+        base = {i: 0.0 for i in lanes}
+        score = 6.0
+        for i, _v in arr:
+            base[i] = score
+            score -= 1.0
+        return base
 
-    # 軸決定：1号艇が総合上位2以内なら1軸、そうでなければ総合1位
-    axis = 1 if 0 in order[:2] else lanes[0]
+    # 各指標の順位スコア
+    r_tenji   = rank([lane_data[i]["展示"]   for i in lanes], higher_is_better=False)
+    r_shukai  = rank([lane_data[i]["周回"]   for i in lanes], higher_is_better=False)
+    r_mawari  = rank([lane_data[i]["周り足"] for i in lanes], higher_is_better=True)
+    r_chokus  = rank([lane_data[i]["直線"]   for i in lanes], higher_is_better=True)
+    r_st      = rank([lane_data[i]["ST"]     for i in lanes], higher_is_better=False)
 
-    # 詳細展開テキスト
-    def top3(rk, label, tip):
-        pairs = [(i+1,rk[i]) for i in range(6) if rk[i]>0]
-        pairs.sort(key=lambda x:x[1])
-        if not pairs: return f"・{label}: データ不足"
-        txt = " / ".join(f"{a}({b}位)" for a,b in pairs[:3])
-        return f"・{label}: {txt}  {tip}"
+    # 内枠バイアス（超控えめ）
+    lane_bias = {1: 1.4, 2: 0.8, 3: 0.4, 4: 0.2, 5: -0.2, 6: -0.6}
 
-    notes = [
-        top3(rk_tenji,"展示","↑タイム良"),
-        top3(rk_shu,"周回","↑旋回力○"),
-        top3(rk_mawa,"周り足","↑出足○"),
-        top3(rk_choku,"直線","↑行き足○"),
-        top3(rk_st,"平均ST","↑スタート安定"),
+    total = {}
+    for i in lanes:
+        total[i] = (
+            0.30 * r_tenji[i] +
+            0.15 * r_shukai[i] +
+            0.25 * r_mawari[i] +
+            0.20 * r_chokus[i] +
+            0.10 * r_st[i] +
+            lane_bias.get(i, 0.0)
+        )
+    return total
+
+def make_picks(scores: Dict[int, float]) -> Dict[str, List[str]]:
+    """
+    スコアから買い目を作る。
+    - 本線: 6点
+    - 抑え: 6点
+    - 狙い: 6点（外枠/捲り目を少し混ぜる）
+    """
+    order = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    heads = [i for i, _ in order]  # スコア順 例: [1,2,3,4,5,6]
+
+    top1, top2, top3, top4, top5, top6 = heads
+
+    def tri(a, b, c): return f"{a}-{b}-{c}"
+
+    main = [
+        tri(top1, top2, top3),
+        tri(top1, top3, top2),
+        tri(top1, top2, top4),
+        tri(top1, top3, top4),
+        tri(top2, top1, top3),
+        tri(top1, top4, top2),
     ]
 
-    scenario_lines = []
-    if axis==1 and rk_tenji[0]<=2 and rk_st[0]<=3:
-        scenario_lines.append("①イン先制の逃げ本線。STも安定、少なくとも2コースの差しを封じる想定。")
-    elif axis in (2,3) and rk_st[axis-1]<=2 and rk_choku[axis-1]<=2:
-        scenario_lines.append(f"{axis}コースの好発から“差し/まくり差し”本線。内残りは2–1/3–1軸で。")
-    elif lanes[0] in (4,5,6) and rk_choku[lanes[0]-1]==1:
-        scenario_lines.append(f"外勢の直線優勢。{lanes[0]}の一撃“まくり”本線、内の残りも押さえ。")
-    else:
-        scenario_lines.append(f"{axis}中心。枠なり想定で相手は上位評価順。")
-
-    # ---- 買い目（多め）----
-    def tri(a,b,c): return f"{a}-{b}-{c}"
-    others = [x for x in lanes if x!=axis]
-    top4 = others[:4] if len(others)>=4 else others
-
-    # 本線：軸→上位4→上位4（順序違い）最大 MAX_MAIN
-    main=[]
-    for i,b in enumerate(top4):
-        for j,c in enumerate(top4):
-            if i==j: continue
-            main.append(tri(axis,b,c))
-
-    # 抑え：相手頭→軸→相手（上位3）最大 MAX_COVER
-    cover=[]
-    top3 = others[:3] if len(others)>=3 else others
-    for i,b in enumerate(top3):
-        for j,c in enumerate(top3):
-            if i==j: continue
-            cover.append(tri(b,axis,c))
-
-    # 狙い：外勢/3番手絡みなど  最大 MAX_ATTACK
-    attack=[]
-    if len(others)>=4:
-        attack += [tri(axis,others[3],others[0]), tri(axis,others[3],others[1])]
-    if len(others)>=3:
-        attack += [tri(others[0],others[2],axis), tri(others[1],others[2],axis)]
-
-    def dedup(seq):
-        out=[]
-        for x in seq:
-            if x not in out: out.append(x)
-        return out
-    main   = dedup(main)[:MAX_MAIN]
-    cover  = [x for x in dedup(cover) if x not in main][:MAX_COVER]
-    attack = [x for x in dedup(attack) if x not in main+cover][:MAX_ATTACK]
-
-    return {
-        "axis": axis,
-        "lanes": lanes,
-        "scenario": " ".join(scenario_lines),
-        "notes": notes,
-        "main": main,
-        "cover": cover,
-        "attack": attack
-    }
-
-def build_reply(place_no: int, race_no: int, ymd: str, data: dict, res: dict) -> str:
-    header = f"📍 {INV_PLACE.get(place_no, f'場No.{place_no}')} {race_no}R ({fmt_ymd(ymd)})\n" + "─"*24
-    body = [
-        f"🧭 展開予想：{res['scenario']}",
-        "🧩 根拠：",
-        *res["notes"],
-        "─"*24,
-        f"🎯 本線（{}点）: ".format(len(res["main"])) + ", ".join(res["main"]) if res["main"] else "🎯 本線: なし",
-        f"🛡️ 抑え（{}点）: ".format(len(res["cover"])) + ", ".join(res["cover"]) if res["cover"] else "🛡️ 抑え: なし",
-        f"💥 狙い（{}点）: ".format(len(res["attack"])) + ", ".join(res["attack"]) if res["attack"] else "💥 狙い: なし",
+    hold = [
+        tri(top2, top3, top1),
+        tri(top3, top1, top2),
+        tri(top1, top5, top3),
+        tri(top1, top2, top5),
+        tri(top2, top4, top1),
+        tri(top3, top2, top4),
     ]
-    tail = []
-    if data.get("fallback"):
-        tail.append(f"\n（データ元：公式フォールバック）\n{data.get('ref_url')}")
-    else:
-        tail.append(f"\n（データ元：ボートレース日和）\n{data.get('ref_url')}")
-    return header + "\n" + "\n".join(body) + "\n" + "\n".join(tail)
 
-# ========== Flask ルート ==========
-@app.get("/")
-def root():
-    return "ok"
+    aim = [
+        tri(top4, top1, top2),
+        tri(top5, top1, top2),
+        tri(top2, top5, top1),
+        tri(top3, top5, top1),
+        tri(top4, top2, top1),
+        tri(top6, top1, top2),
+    ]
 
-@app.get("/health")
-def health():
-    return jsonify(status="ok")
+    # 重複削除＆上位から
+    def uniq(xs):
+        seen, out = set(), []
+        for x in xs:
+            if x not in seen:
+                seen.add(x); out.append(x)
+        return out[:12]
+    return {"main": uniq(main), "hold": uniq(hold), "sniper": uniq(aim)}
 
-@app.get("/_debug/biyori")
-def debug_biyori():
-    place_no = int(request.args.get("place_no", "15"))
-    race_no  = int(request.args.get("race_no", "5"))
-    ymd      = request.args.get("hiduke", today_ymd())
-    data = fetch_biyori_with_fallback(place_no, race_no, ymd)
-    return jsonify(data)
+def format_pick_lines(picks: Dict[str, List[str]]) -> List[str]:
+    def make(label, icon, key):
+        arr = picks.get(key) or []
+        return f"{icon} {label}（{len(arr)}点）: {', '.join(arr) if arr else 'なし'}"
+    return [
+        make("本線", "🎯", "main"),
+        make("抑え", "🛡️", "hold"),
+        make("狙い", "💥", "sniper"),
+    ]
 
-@app.post("/callback")
+def build_scenario(scores: Dict[int, float], lane_data: Dict[int, Dict[str, Optional[float]]]) -> str:
+    """
+    展開予想テキスト（短文）
+    """
+    order = [i for i, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
+    head = order[0]
+    tail  = order[-1]
+
+    # 直線・周り足が良い艇
+    def top_of(key, higher=True):
+        arr = [(i, lane_data[i][key]) for i in range(1, 7) if lane_data[i][key] is not None]
+        if not arr:
+            return None
+        arr.sort(key=lambda x: x[1], reverse=higher)
+        return arr[0][0]
+
+    fast_st = top_of("ST", higher=False)
+    good_str = top_of("直線", True)
+    good_turn = top_of("周り足", True)
+
+    msgs = []
+    msgs.append(f"①{head}頭が本線。")
+    if fast_st and fast_st == head:
+        msgs.append("STも速く先制濃厚。")
+    elif fast_st:
+        msgs.append(f"STは{fast_st}が速く差し/捲りの警戒。")
+
+    if good_turn:
+        msgs.append(f"周り足は{good_turn}が良く内差し有力。")
+    if good_str and good_str != good_turn:
+        msgs.append(f"直線は{good_str}が伸び目。")
+
+    msgs.append(f"穴は外の{tail}連動。")
+    return " ".join(msgs)
+
+# -----------------------------
+# LINE Webhook
+# -----------------------------
+@app.route("/callback", methods=["POST"])
 def callback():
     if not handler:
-        return "LINE handler not set", 500
+        return "LINE未設定", 200
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        return "Invalid signature", 400
+        abort(400)
     return "OK"
 
 @handler.add(MessageEvent, message=TextMessage)
-def on_text(event: MessageEvent):
+def handle_message(event: MessageEvent):
     text = (event.message.text or "").strip()
-    place_no, race_no, ymd = parse_user_text(text)
-    if place_no == "HELP":
-        msg = ("使い方：\n"
-               "・『丸亀 8』 / 『丸亀 8 20250811』のように送信\n"
-               "・日和の直前&MyDataを優先取得、ダメなら公式に自動フォールバック\n"
-               "・買い目は 本線/抑え/狙い を多めに表示")
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
-        return
-    if not (place_no and race_no and ymd):
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text="入力例：『丸亀 8』 / 『丸亀 8 20250811』 / 『help』"))
+    if text.lower() in ("help", "ヘルプ"):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(_usage()))
         return
 
-    data = fetch_biyori_with_fallback(place_no, race_no, ymd)
-    if data.get("fallback") and data.get("src")=="official":
-        # データ不足時：汎用の押さえ目（最小限）を返す
-        msg = (f"📍 {INV_PLACE.get(place_no)} {race_no}R ({fmt_ymd(ymd)})\n"
-               "─"*24 + "\n"
-               "日和の直前/MyDataが未取得のため、公式へフォールバック。\n"
-               "データ不足なので汎用の押さえ目のみ。\n\n"
-               "🎯 本線: 1-2-3, 1-3-2, 1-2-4, 1-3-4\n"
-               "🛡️ 抑え: 2-1-3, 3-1-2\n"
-               f"\n（公式URL）\n{data.get('ref_url')}")
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+    m = re.match(r"(\S+)\s+(\d{1,2})\s+(\d{8})", text)
+    if not m:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(_usage()))
         return
 
+    place_name, race_no_s, hiduke = m.group(1), m.group(2), m.group(3)
+    place_no = PLACE_NO.get(place_name)
+    if not place_no:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage("場名が分かりません。例) 丸亀 8 20250811"))
+        return
+
+    race_no = int(race_no_s)
+    # まず slider=4 → ダメなら 9
+    for slider in (4, 9):
+        try:
+            html = fetch_biyori(place_no, race_no, hiduke, slider=slider)
+            lanes = parse_biyori_metrics(html)
+            scores = score_lanes(lanes)
+            picks = make_picks(scores)
+
+            title = f"📍 {place_name} {race_no}R ({datetime.strptime(hiduke, '%Y%m%d').strftime('%Y/%m/%d')})"
+            scenario = build_scenario(scores, lanes)
+            lines = [
+                title,
+                "――――――――――――――",
+                f"🔎 展開予想：{scenario}",
+                "――――――――――――――",
+            ]
+            lines.extend(format_pick_lines(picks))
+            lines.append(f"(src: 日和 / {BIYORI_URL}?place_no={place_no}&race_no={race_no}&hiduke={hiduke}&slider={slider})")
+
+            line_bot_api.reply_message(event.reply_token, TextSendMessage("\n".join(lines)))
+            return
+        except Exception as e:
+            logger.warning(f"[biyori] fetch/parse failed slider={slider} : {e}")
+
+    # フォールバック（公式リンクだけ提示）
+    url_official = (
+        f"https://www.boatrace.jp/owpc/pc/race/beforeinfo?"
+        f"rno={race_no}&jcd={place_no:02d}&hd={hiduke}"
+    )
+    msg = (
+        f"📍 {place_name} {race_no}R ({datetime.strptime(hiduke, '%Y%m%d').strftime('%Y/%m/%d')})\n"
+        "直前情報の取得に失敗しました。少し待ってから再度お試しください。\n"
+        f"(src: 公式 / {url_official})"
+    )
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(msg))
+
+def _usage() -> str:
+    return (
+        "入力例：『丸亀 8 20250811』 / 『help』\n"
+        "・場名 半角スペース レース番号 日付(YYYYMMDD)\n"
+        "・直前情報はボートレース日和を優先し、取得失敗時は公式リンクを案内します。"
+    )
+
+# -----------------------------
+# Debug 用 (ブラウザで動作確認)
+# -----------------------------
+@app.get("/")
+def root():
+    return "yosou-bot alive", 200
+
+@app.get("/_debug/biyori")
+def debug_biyori():
     try:
-        res = analyze_and_build_bets(data)
-        msg = build_reply(place_no, race_no, ymd, data, res)
+        place_no = int(request.args.get("place_no", "15"))
+        race_no  = int(request.args.get("race_no", "12"))
+        hiduke   = request.args.get("hiduke", datetime.now().strftime("%Y%m%d"))
+        slider   = int(request.args.get("slider", "4"))
+        html = fetch_biyori(place_no, race_no, hiduke, slider=slider)
+        lanes = parse_biyori_metrics(html)
+        scores = score_lanes(lanes)
+        picks  = make_picks(scores)
+        return jsonify({"lanes": lanes, "scores": scores, "picks": picks})
     except Exception as e:
-        msg = (f"📍 {INV_PLACE.get(place_no)} {race_no}R ({fmt_ymd(ymd)})\n"
-               "解析中にエラーが発生しました。時間をおいて再度お試しください。")
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
-
-# ===== エントリーポイント =====
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+        return f"[biyori] {e}", 200
